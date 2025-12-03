@@ -1,0 +1,12 @@
+{
+  "actorSpecification": 1,
+  "name": "soldcomp-analyser2",
+  "version": "0.1",
+  "buildTag": "latest",
+  "environmentVariables": {
+    "KV_STORE_NAME": "clive.caseley/soldcomp-analyser-kvs",
+    "DATA_KEY": "data.csv",
+    "OUTPUT_KEY": "output.csv"
+  },
+  "dockerfile": "./Dockerfile"
+}
