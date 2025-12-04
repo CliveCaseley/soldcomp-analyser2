@@ -39,6 +39,8 @@ const STANDARD_HEADERS = [
 /**
  * Common variations of column names for fuzzy matching
  */
+// IMPORTANT: Order matters! More specific headers should come before more general ones
+// to ensure proper matching (e.g., £/sqft before Sq. ft)
 const HEADER_VARIATIONS = {
     'Date of sale': ['date', 'sale date', 'sold date', 'transaction date', 'date of sale'],
     'Address': ['address', 'property address', 'full address', 'street address'],
@@ -47,9 +49,9 @@ const HEADER_VARIATIONS = {
     'Tenure': ['tenure', 'freehold', 'leasehold'],
     'Age at sale': ['age', 'age at sale', 'property age', 'years old'],
     'Price': ['price', 'sale price', 'sold price', 'amount'],
+    '£/sqft': ['£/sqft', 'price per sqft', 'per sqft', '£ per sqft', '£ sqft', '£sqft'],  // Check this BEFORE Sq. ft
     'Sq. ft': ['sq ft', 'sqft', 'square feet', 'sq. ft', 'sq.ft', 'square ft'],
     'Sqm': ['sqm', 'sq m', 'square meters', 'square metres', 'sq. m'],
-    '£/sqft': ['£/sqft', 'price per sqft', 'per sqft', '£ per sqft'],
     'Bedrooms': ['bedrooms', 'beds', 'bedroom', 'bed'],
     'Distance': ['distance', 'distance from target'],
     'Latitude': ['latitude', 'lat'],
@@ -104,12 +106,13 @@ function parseCSV(csvContent) {
 
         log.info(`Parsed ${records.length} rows from CSV`);
 
-        // Detect headers
-        const headerMapping = detectHeaders(records);
+        // Detect headers (returns both mapping and row index)
+        const { headerMapping, headerRowIndex } = detectHeaders(records);
         log.info('Header mapping detected:', headerMapping);
+        log.info(`Header row index: ${headerRowIndex}`);
 
         // Convert to objects with standard headers
-        const normalizedData = normalizeData(records, headerMapping);
+        const normalizedData = normalizeData(records, headerMapping, headerRowIndex);
         log.info(`Normalized ${normalizedData.length} data rows`);
 
         return normalizedData;
@@ -121,42 +124,128 @@ function parseCSV(csvContent) {
 
 /**
  * Detect headers using fuzzy matching
+ * CRITICAL FIX: Scans first 10 rows to find the actual header row instead of assuming row 1
+ * 
  * @param {Array<Array>} records - Raw CSV rows
- * @returns {Object} Mapping of detected column indices to standard headers
+ * @returns {Object} Object containing headerMapping and headerRowIndex
  */
 function detectHeaders(records) {
-    const headerMapping = {};
-    const headerRow = records[0];
-
-    log.info('Attempting to detect headers...');
-    log.info('First row:', headerRow);
-
-    for (let colIndex = 0; colIndex < headerRow.length; colIndex++) {
-        const cellValue = String(headerRow[colIndex]).toLowerCase().trim();
+    log.info('Attempting to detect headers with smart scanning...');
+    
+    // Expected core column names that should appear in a valid header row
+    const CORE_COLUMNS = ['date', 'address', 'postcode', 'price'];
+    
+    // Scan the first 10 rows (or all rows if less than 10)
+    const rowsToScan = Math.min(10, records.length);
+    let bestHeaderRow = -1;
+    let bestHeaderMapping = {};
+    let bestMatchScore = 0;
+    
+    log.info(`Scanning first ${rowsToScan} rows to find header row...`);
+    
+    for (let rowIndex = 0; rowIndex < rowsToScan; rowIndex++) {
+        const row = records[rowIndex];
+        const headerMapping = {};
+        let matchedColumns = 0;
+        let coreColumnsMatched = 0;
         
-        // Try to match with standard headers using fuzzy matching
-        let bestMatch = null;
-        let bestScore = 0;
+        // Try to match each cell in this row to standard headers
+        for (let colIndex = 0; colIndex < row.length; colIndex++) {
+            const cellValue = String(row[colIndex]).toLowerCase().trim();
+            
+            // Skip empty cells
+            if (cellValue === '') continue;
+            
+            // Try to match with standard headers using fuzzy matching
+            let bestMatch = null;
+            let bestScore = 0;
 
-        for (const [standardHeader, variations] of Object.entries(HEADER_VARIATIONS)) {
-            for (const variation of variations) {
-                const score = fuzzball.ratio(cellValue, variation);
-                if (score > bestScore && score > 70) { // 70% threshold
-                    bestScore = score;
-                    bestMatch = standardHeader;
+            for (const [standardHeader, variations] of Object.entries(HEADER_VARIATIONS)) {
+                for (const variation of variations) {
+                    // Check for exact match first (100% priority)
+                    if (cellValue === variation) {
+                        bestScore = 100;
+                        bestMatch = standardHeader;
+                        break;
+                    }
+                    
+                    // Otherwise use fuzzy matching
+                    const score = fuzzball.ratio(cellValue, variation);
+                    if (score > bestScore && score > 70) { // 70% threshold
+                        bestScore = score;
+                        bestMatch = standardHeader;
+                    }
+                }
+                
+                // If we found an exact match, stop searching
+                if (bestScore === 100) break;
+            }
+
+            if (bestMatch) {
+                headerMapping[colIndex] = bestMatch;
+                matchedColumns++;
+                
+                // Check if this is a core column
+                const standardHeaderLower = bestMatch.toLowerCase();
+                if (CORE_COLUMNS.some(core => standardHeaderLower.includes(core))) {
+                    coreColumnsMatched++;
                 }
             }
         }
-
-        if (bestMatch) {
-            headerMapping[colIndex] = bestMatch;
-            log.info(`Mapped column ${colIndex} ("${cellValue}") to "${bestMatch}" (score: ${bestScore})`);
-        } else {
-            log.warning(`Could not map column ${colIndex} ("${cellValue}") - no match found`);
+        
+        // Calculate a score for this row: number of matched columns + bonus for core columns
+        const rowScore = matchedColumns + (coreColumnsMatched * 2);
+        
+        log.info(`Row ${rowIndex}: ${matchedColumns} columns matched (${coreColumnsMatched} core columns), score: ${rowScore}`);
+        
+        // If this row has a better score, use it as the header row
+        if (rowScore > bestMatchScore && coreColumnsMatched >= 2) {
+            bestMatchScore = rowScore;
+            bestHeaderRow = rowIndex;
+            bestHeaderMapping = headerMapping;
+            log.info(`✓ New best header row candidate: row ${rowIndex}`);
         }
     }
-
-    return headerMapping;
+    
+    // If no header row found, default to row 0 (backward compatibility)
+    if (bestHeaderRow === -1) {
+        log.warning('No clear header row found in first 10 rows, defaulting to row 0');
+        bestHeaderRow = 0;
+        // Try to map row 0 anyway
+        const row = records[0];
+        for (let colIndex = 0; colIndex < row.length; colIndex++) {
+            const cellValue = String(row[colIndex]).toLowerCase().trim();
+            let bestMatch = null;
+            let bestScore = 0;
+            for (const [standardHeader, variations] of Object.entries(HEADER_VARIATIONS)) {
+                for (const variation of variations) {
+                    const score = fuzzball.ratio(cellValue, variation);
+                    if (score > bestScore && score > 70) {
+                        bestScore = score;
+                        bestMatch = standardHeader;
+                    }
+                }
+            }
+            if (bestMatch) {
+                bestHeaderMapping[colIndex] = bestMatch;
+            }
+        }
+    }
+    
+    log.info(`✓ Header row detected at row ${bestHeaderRow}`);
+    log.info('Header row content:', records[bestHeaderRow]);
+    log.info('Header mapping:', bestHeaderMapping);
+    
+    // Log each mapped column for clarity
+    for (const [colIndex, standardHeader] of Object.entries(bestHeaderMapping)) {
+        const cellValue = records[bestHeaderRow][colIndex];
+        log.info(`  Column ${colIndex} ("${cellValue}") → "${standardHeader}"`);
+    }
+    
+    return {
+        headerMapping: bestHeaderMapping,
+        headerRowIndex: bestHeaderRow
+    };
 }
 
 /**
@@ -167,15 +256,24 @@ function detectHeaders(records) {
  * - Properly maps URL to URL/Link columns instead of wrong columns
  * - Flags URL-only rows for scraping with needs_review
  * 
+ * CRITICAL FIX (v2.2): Smart Header Row Detection
+ * - Now accepts headerRowIndex parameter to skip all rows before the actual header row
+ * - Prevents rows before the header (e.g., TARGET metadata) from being parsed as data
+ * 
  * @param {Array<Array>} records - Raw CSV rows
  * @param {Object} headerMapping - Mapping of column indices to standard headers
+ * @param {number} headerRowIndex - Index of the row containing headers
  * @returns {Array<Object>} Normalized data objects
  */
-function normalizeData(records, headerMapping) {
+function normalizeData(records, headerMapping, headerRowIndex) {
     const normalizedData = [];
     
-    // Skip first row (header row) if it was detected as headers
-    const startIndex = Object.keys(headerMapping).length > 0 ? 1 : 0;
+    // Start processing from the row AFTER the header row
+    // This ensures we skip any metadata rows (like TARGET) that appear before the header
+    const startIndex = headerRowIndex + 1;
+    
+    log.info(`Processing data rows starting from row ${startIndex} (skipping ${startIndex} rows including header at row ${headerRowIndex})`);
+    log.info(`Total rows to process: ${records.length - startIndex}`);
 
     for (let i = startIndex; i < records.length; i++) {
         const row = records[i];
