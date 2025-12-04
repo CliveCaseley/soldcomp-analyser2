@@ -16,6 +16,13 @@ const { log } = require('apify');
  * - NOT 'lmk-key' (64-char hash) which causes 404 errors on the website
  * - URL format: https://find-energy-certificate.service.gov.uk/energy-certificate/{certificate-number}
  * 
+ * CRITICAL FIX (v2.4): Two-Step Certificate Number Retrieval
+ * - Search API does NOT return certificate-number in results
+ * - Step 1: Search API returns lmk-key for matching properties
+ * - Step 2: Call individual certificate API: /api/v1/domestic/certificate/{lmk-key}
+ * - Step 3: Extract certificate-number (RRN) from individual certificate response
+ * - Build URL: https://find-energy-certificate.service.gov.uk/energy-certificate/{certificate-number}
+ * 
  * API Documentation: https://epc.opendatacommunities.org/docs/api
  */
 
@@ -43,7 +50,68 @@ function isValidCertificateNumber(certificateNumber) {
 }
 
 /**
+ * Fetch individual certificate details using lmk-key
+ * This is required because the search API doesn't always return certificate-number
+ * @param {string} lmkKey - The lmk-key from search results
+ * @param {string} apiKey - EPC API key
+ * @param {string} email - EPC registered email
+ * @returns {Promise<Object|null>} Certificate details including certificate-number
+ */
+async function fetchCertificateByLmkKey(lmkKey, apiKey, email) {
+    if (!lmkKey || !apiKey) {
+        log.warning('Cannot fetch certificate: missing lmk-key or API key');
+        return null;
+    }
+    
+    log.info(`Fetching individual certificate for lmk-key: ${lmkKey.substring(0, 16)}...`);
+    
+    try {
+        // Individual certificate endpoint
+        const certificateURL = `https://epc.opendatacommunities.org/api/v1/domestic/certificate/${lmkKey}`;
+        const auth = Buffer.from(`${email}:${apiKey}`).toString('base64');
+        
+        const response = await axios.get(certificateURL, {
+            headers: {
+                'Authorization': `Basic ${auth}`,
+                'Accept': 'application/json'
+            },
+            timeout: 10000
+        });
+        
+        if (!response.data || !response.data.rows || response.data.rows.length === 0) {
+            log.warning('No certificate data returned from individual certificate API');
+            return null;
+        }
+        
+        const certificate = response.data.rows[0];
+        const certificateNumber = certificate['certificate-number'];
+        
+        if (certificateNumber) {
+            log.info(`Retrieved certificate-number from individual API: ${certificateNumber}`);
+            return {
+                certificateNumber: certificateNumber,
+                lmkKey: lmkKey,
+                rating: certificate['current-energy-rating'],
+                floorArea: certificate['total-floor-area'],
+                address1: certificate['address1'],
+                address2: certificate['address2'],
+                address3: certificate['address3'],
+                postcode: certificate['postcode']
+            };
+        }
+        
+        log.warning('Certificate data returned but no certificate-number field');
+        return null;
+        
+    } catch (error) {
+        log.warning(`Failed to fetch individual certificate: ${error.message}`);
+        return null;
+    }
+}
+
+/**
  * Get certificate number by looking up via postcode
+ * Uses two-step process: search API -> individual certificate API
  * @param {string} postcode - Property postcode
  * @param {string} address - Property address for matching
  * @param {string} apiKey - EPC API key
@@ -86,24 +154,44 @@ async function getCertificateNumber(postcode, address, apiKey) {
         // Find best matching address
         const bestMatch = findBestAddressMatch(results, address);
         
-        if (bestMatch && bestMatch['certificate-number']) {
-            const certificateNumber = bestMatch['certificate-number'];
-            
-            // Verify it's the valid format
-            if (isValidCertificateNumber(certificateNumber)) {
-                log.info(`Found certificate number: ${certificateNumber}`);
-                return {
-                    certificateNumber: certificateNumber,
-                    lmkKey: bestMatch['lmk-key'],
-                    rating: bestMatch['current-energy-rating'],
-                    floorArea: bestMatch['total-floor-area']
-                };
-            } else {
-                log.warning(`Invalid certificate number format: ${certificateNumber}`);
-            }
+        if (!bestMatch) {
+            log.warning('No matching address found in search results');
+            return null;
         }
         
+        // Get lmk-key from search result
+        const lmkKey = bestMatch['lmk-key'];
+        
+        // Check if certificate-number is directly available in search results
+        if (bestMatch['certificate-number'] && isValidCertificateNumber(bestMatch['certificate-number'])) {
+            const certificateNumber = bestMatch['certificate-number'];
+            log.info(`Found certificate number in search results: ${certificateNumber}`);
+            return {
+                certificateNumber: certificateNumber,
+                lmkKey: lmkKey,
+                rating: bestMatch['current-energy-rating'],
+                floorArea: bestMatch['total-floor-area']
+            };
+        }
+        
+        // CRITICAL FIX: Certificate-number not in search results, fetch via individual certificate API
+        log.info(`Certificate-number not in search results, fetching via individual certificate API using lmk-key`);
+        
+        if (!lmkKey) {
+            log.warning('No lmk-key found in search results, cannot fetch certificate');
+            return null;
+        }
+        
+        const certData = await fetchCertificateByLmkKey(lmkKey, apiKey, email);
+        
+        if (certData && certData.certificateNumber) {
+            log.info(`Successfully retrieved certificate-number via individual API: ${certData.certificateNumber}`);
+            return certData;
+        }
+        
+        log.warning('Failed to retrieve certificate-number from individual certificate API');
         return null;
+        
     } catch (error) {
         log.warning(`Failed to get certificate number: ${error.message}`);
         return null;
@@ -122,6 +210,7 @@ function generateEPCSearchURL(postcode) {
 
 /**
  * Fetch EPC data using official API
+ * Uses two-step process: search API -> individual certificate API for certificate-number
  * @param {string} postcode - Property postcode
  * @param {string} address - Property address
  * @param {string} apiKey - EPC API key
@@ -171,18 +260,36 @@ async function fetchEPCDataViaAPI(postcode, address, apiKey) {
         const bestMatch = findBestAddressMatch(results, address);
         
         if (bestMatch) {
-            // CRITICAL FIX: Use 'certificate-number' field for certificate URLs
-            // NOT 'lmk-key' (64-char hash) - that causes 404 errors on the website
-            // certificate-number format: XXXX-XXXX-XXXX-XXXX-XXXX
-            const certificateNumber = bestMatch['certificate-number'];
-            const lmkKey = bestMatch['lmk-key']; // Keep for reference/logging only
+            // Get lmk-key from search result
+            const lmkKey = bestMatch['lmk-key'];
+            let certificateNumber = bestMatch['certificate-number'];
+            let rating = bestMatch['current-energy-rating'];
+            let floorArea = bestMatch['total-floor-area'];
             
-            if (!certificateNumber) {
-                log.warning(`No certificate-number found for ${address}, using search URL instead`);
+            // CRITICAL FIX (v2.4): If certificate-number not in search results, fetch via individual certificate API
+            if (!certificateNumber || !isValidCertificateNumber(certificateNumber)) {
+                log.info(`Certificate-number not in search results for ${address}, fetching via individual certificate API`);
+                
+                if (lmkKey) {
+                    const certData = await fetchCertificateByLmkKey(lmkKey, apiKey, email);
+                    
+                    if (certData && certData.certificateNumber) {
+                        certificateNumber = certData.certificateNumber;
+                        // Use data from individual certificate API if available
+                        rating = certData.rating || rating;
+                        floorArea = certData.floorArea || floorArea;
+                        log.info(`Successfully retrieved certificate-number via individual API: ${certificateNumber}`);
+                    }
+                }
+            }
+            
+            // If still no certificate number, fallback to search URL
+            if (!certificateNumber || !isValidCertificateNumber(certificateNumber)) {
+                log.warning(`Could not retrieve certificate-number for ${address}, using search URL instead`);
                 return {
-                    rating: bestMatch['current-energy-rating'],
+                    rating: rating,
                     searchURL: generateEPCSearchURL(postcode),
-                    floorArea: bestMatch['total-floor-area'],
+                    floorArea: floorArea,
                     lmkKey: lmkKey,
                     certificateNumber: null,
                     certificateURL: null,
@@ -191,9 +298,9 @@ async function fetchEPCDataViaAPI(postcode, address, apiKey) {
             }
             
             const epcData = {
-                rating: bestMatch['current-energy-rating'],
+                rating: rating,
                 certificateURL: `https://find-energy-certificate.service.gov.uk/energy-certificate/${certificateNumber}`,
-                floorArea: bestMatch['total-floor-area'],
+                floorArea: floorArea,
                 lmkKey: lmkKey, // Keep for reference
                 certificateNumber: certificateNumber
             };
@@ -355,5 +462,6 @@ module.exports = {
     scrapeEPCData,
     createEPCLookupRow,
     isValidCertificateNumber,
-    getCertificateNumber
+    getCertificateNumber,
+    fetchCertificateByLmkKey
 };
