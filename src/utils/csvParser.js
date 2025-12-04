@@ -1,6 +1,7 @@
 const { parse } = require('csv-parse/sync');
 const fuzzball = require('fuzzball');
 const { log } = require('apify');
+const { standardizeDateFormat } = require('./dateFormatter');
 
 /**
  * Standard schema for property data
@@ -299,6 +300,14 @@ function cleanProperty(property) {
     // Normalize address (trim, consistent spacing)
     if (cleaned.Address) {
         cleaned.Address = cleaned.Address.replace(/\s+/g, ' ').trim();
+    }
+
+    // CRITICAL FIX: Standardize date format to DD/MM/YYYY
+    if (cleaned['Date of sale']) {
+        const standardizedDate = standardizeDateFormat(cleaned['Date of sale']);
+        if (standardizedDate) {
+            cleaned['Date of sale'] = standardizedDate;
+        }
     }
 
     return cleaned;

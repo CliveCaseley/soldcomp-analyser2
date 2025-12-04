@@ -1,6 +1,7 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { log } = require('apify');
+const { standardizeDateFormat } = require('../utils/dateFormatter');
 
 /**
  * Rate limiting configuration
@@ -63,7 +64,8 @@ async function scrapeRightmoveListing(url) {
             if (dateMatch && dateMatch[0]) {
                 const extractedDate = dateMatch[0].match(/(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})/i);
                 if (extractedDate) {
-                    data['Date of sale'] = extractedDate[1];
+                    const standardizedDate = standardizeDateFormat(extractedDate[1]);
+                    data['Date of sale'] = standardizedDate || extractedDate[1]; // Use original if standardization fails
                 }
             }
 
@@ -171,7 +173,8 @@ async function scrapeRightmoveListing(url) {
             // Extract date of sale (for sold properties)
             const saleDate = $('div:contains("Sold")').text().match(/Sold\s+on\s+([\d\/]+)/i);
             if (saleDate) {
-                data['Date of sale'] = saleDate[1];
+                const standardizedDate = standardizeDateFormat(saleDate[1]);
+                data['Date of sale'] = standardizedDate || saleDate[1]; // Use original if standardization fails
             }
         }
 

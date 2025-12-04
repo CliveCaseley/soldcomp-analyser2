@@ -63,6 +63,16 @@ function isEmptyRow(row) {
 
 /**
  * Write CSV to Apify Key-Value Store
+ * 
+ * CRITICAL FIX: UTF-8 Character Encoding
+ * - Explicitly sets charset=utf-8 in contentType to prevent double-encoding
+ * - Ensures £ symbols appear correctly without "Â" prefix
+ * - Prevents UTF-8 bytes from being misinterpreted as Latin-1
+ * 
+ * Issue: "Â£" appearing instead of "£" in CSV output
+ * Cause: UTF-8 bytes (0xC2 0xA3 for £) misinterpreted without proper charset declaration
+ * Solution: Add charset=utf-8 to contentType header
+ * 
  * @param {Array<Object>} properties - Array of property objects
  * @param {string} storeName - KVS store name
  * @param {string} key - Key name
@@ -79,19 +89,22 @@ async function writeCSVToKVS(properties, storeName, key) {
             log.info(`Removed ${removedCount} empty duplicate rows from output`);
         }
         
-        // Convert properties to CSV
+        // Convert properties to CSV with explicit UTF-8 encoding
         const csv = stringify(filteredProperties, {
             header: true,
-            columns: STANDARD_HEADERS
+            columns: STANDARD_HEADERS,
+            // Ensure proper encoding of special characters (£, €, etc.)
+            encoding: 'utf8'
         });
         
         // Open named key-value store
         const store = await Actor.openKeyValueStore(storeName);
         
-        // Save the CSV
-        await store.setValue(key, csv, { contentType: 'text/csv' });
+        // CRITICAL FIX: Add charset=utf-8 to prevent character encoding issues
+        // Without this, £ (U+00A3) gets double-encoded as Â£ (U+00C2 U+00A3)
+        await store.setValue(key, csv, { contentType: 'text/csv; charset=utf-8' });
         
-        log.info(`Successfully wrote CSV to KVS (${csv.length} bytes, ${filteredProperties.length} rows)`);
+        log.info(`Successfully wrote CSV to KVS (${csv.length} bytes, ${filteredProperties.length} rows) with UTF-8 encoding`);
     } catch (error) {
         log.error(`Failed to write to KVS: ${error.message}`);
         throw error;

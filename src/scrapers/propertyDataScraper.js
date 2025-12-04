@@ -1,6 +1,7 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { log } = require('apify');
+const { standardizeDateFormat } = require('../utils/dateFormatter');
 
 /**
  * Rate limiting configuration
@@ -74,7 +75,10 @@ async function scrapePropertyData(url) {
             // Date of sale
             if (text.match(/Date of sale|Sale date/i)) {
                 const date = $(elem).find('td').last().text().trim() || text.split(':').pop().trim();
-                if (date) data['Date of sale'] = date;
+                if (date) {
+                    const standardizedDate = standardizeDateFormat(date);
+                    data['Date of sale'] = standardizedDate || date; // Use original if standardization fails
+                }
             }
             
             // Price

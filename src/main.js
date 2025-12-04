@@ -90,9 +90,21 @@ Actor.main(async () => {
         // Step 10: Geocode properties and calculate distances
         if (GOOGLE_API_KEY) {
             log.info('=== STEP 9: Geocoding and calculating distances ===');
+            log.info(`Geocoding ${allProperties.length} properties + target property`);
             await geocodeAndCalculateDistances(allProperties, target, GOOGLE_API_KEY);
+            
+            // Verify geocoding results
+            const geocodedCount = allProperties.filter(p => p.Latitude && p.Longitude).length;
+            log.info(`Geocoding complete: ${geocodedCount}/${allProperties.length} properties geocoded`);
+            if (target.Latitude && target.Longitude) {
+                log.info(`Target property geocoded: (${target.Latitude}, ${target.Longitude})`);
+            } else {
+                log.warning('Target property geocoding failed - distances cannot be calculated');
+            }
         } else {
-            log.warning('Skipping geocoding and distance calculation (no GOOGLE_API_KEY)');
+            log.warning('⚠️  SKIPPING GEOCODING: GOOGLE_API_KEY not set');
+            log.warning('⚠️  Latitude, Longitude, and Distance columns will be empty');
+            log.warning('⚠️  Set GOOGLE_API_KEY environment variable to enable geocoding');
         }
         
         // Step 11: Enrich with EPC data
@@ -220,12 +232,19 @@ async function geocodeAndCalculateDistances(properties, target, apiKey) {
     target['Google Streetview Link'] = `=HYPERLINK("${targetStreetviewURL}", "View Map")`;
     
     // Geocode all comparable properties
+    let geocodedCount = 0;
+    let failedCount = 0;
+    
     for (const property of properties) {
         if (!property.Address || !property.Postcode) {
             log.warning(`Skipping geocoding for property without address/postcode`);
             property.needs_review = 1;
+            failedCount++;
             continue;
         }
+        
+        // Add small delay between geocoding requests to avoid rate limiting (0.5 seconds)
+        await new Promise(resolve => setTimeout(resolve, 500));
         
         const geocode = await geocodeAddress(property.Address, property.Postcode, apiKey);
         
@@ -248,12 +267,16 @@ async function geocodeAndCalculateDistances(properties, target, apiKey) {
             property._distanceValue = distance; // Store numeric value for ranking
             property.Distance = formatDistance(distance);
             
-            log.info(`  ${property.Address}: ${property.Distance} (${geocode.lat}, ${geocode.lng})`);
+            geocodedCount++;
+            log.info(`  ✓ ${property.Address}: ${property.Distance} (${geocode.lat}, ${geocode.lng})`);
         } else {
-            log.warning(`Failed to geocode: ${property.Address}, ${property.Postcode}`);
+            log.warning(`  ✗ Failed to geocode: ${property.Address}, ${property.Postcode}`);
             property.needs_review = 1;
+            failedCount++;
         }
     }
+    
+    log.info(`Geocoding summary: ${geocodedCount} successful, ${failedCount} failed`);
 }
 
 /**
