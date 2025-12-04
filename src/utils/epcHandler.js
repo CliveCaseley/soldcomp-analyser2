@@ -11,69 +11,51 @@ const { log } = require('apify');
  * - Falls back to web scraping if API unavailable
  * - Addresses Issue #10: EPC link misplacement
  * 
- * CRITICAL FIX (v2.2): Certificate ID Hash Format
- * - Old format: 34-digit numeric IDs (deprecated, causes 404 errors)
- * - New format: 64-character SHA-256 hash
- * - Automatically detects old format and converts via postcode lookup
+ * CRITICAL FIX (v2.3): Certificate Number URL Format
+ * - EPC certificate URLs use 'certificate-number' field (format: XXXX-XXXX-XXXX-XXXX-XXXX)
+ * - NOT 'lmk-key' (64-char hash) which causes 404 errors on the website
+ * - URL format: https://find-energy-certificate.service.gov.uk/energy-certificate/{certificate-number}
  * 
  * API Documentation: https://epc.opendatacommunities.org/docs/api
  */
 
 /**
- * Check if a certificate ID is in old numeric format (deprecated)
- * Old format: 34-digit numeric string (causes 404 errors)
- * New format: 64-character alphanumeric SHA-256 hash
- * @param {string} lmkKey - The certificate ID to check
- * @returns {boolean} True if old format, false if new hash format
+ * Validate certificate number format
+ * Valid format: XXXX-XXXX-XXXX-XXXX-XXXX (20 chars with 4 hyphens = 24 total)
+ * @param {string} certificateNumber - The certificate number to validate
+ * @returns {boolean} True if valid format
  */
-function isOldCertificateFormat(lmkKey) {
-    if (!lmkKey || typeof lmkKey !== 'string') {
+function isValidCertificateNumber(certificateNumber) {
+    if (!certificateNumber || typeof certificateNumber !== 'string') {
         return false;
     }
     
-    // Old format: 34 digits (numeric only)
-    // Example: 1234567890123456789012345678901234
-    const isOldNumeric = /^\d{30,40}$/.test(lmkKey);
+    // Certificate number format: XXXX-XXXX-XXXX-XXXX-XXXX
+    // Pattern: 4 alphanumeric chars, hyphen, repeated 5 times (last group has no trailing hyphen)
+    const certPattern = /^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
     
-    // New format: 64 characters (alphanumeric, SHA-256 hash)
-    // Example: a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6a7b8c9d0e1f2
-    const isNewHash = /^[a-f0-9]{64}$/i.test(lmkKey);
-    
-    if (isNewHash) {
-        return false; // Already in new format
-    }
-    
-    // If it's all numeric and roughly the right length, it's old format
-    if (isOldNumeric) {
-        log.warning(`Detected old EPC certificate format: ${lmkKey} (${lmkKey.length} chars)`);
+    if (certPattern.test(certificateNumber)) {
         return true;
     }
     
-    // For other formats (like mixed alphanumeric), check length
-    // New format should be exactly 64 characters
-    if (lmkKey.length !== 64) {
-        log.warning(`Potentially invalid EPC certificate format: ${lmkKey} (${lmkKey.length} chars, expected 64)`);
-        return true; // Treat as old/invalid format
-    }
-    
+    log.warning(`Invalid certificate number format: ${certificateNumber}`);
     return false;
 }
 
 /**
- * Get new hash format certificate ID by looking up via postcode
+ * Get certificate number by looking up via postcode
  * @param {string} postcode - Property postcode
  * @param {string} address - Property address for matching
  * @param {string} apiKey - EPC API key
- * @param {string} oldLmkKey - Old certificate ID (for logging)
- * @returns {Promise<string|null>} New hash format certificate ID or null
+ * @returns {Promise<Object|null>} Certificate data with number or null
  */
-async function getNewCertificateHash(postcode, address, apiKey, oldLmkKey = null) {
+async function getCertificateNumber(postcode, address, apiKey) {
     if (!apiKey || !postcode) {
-        log.warning('Cannot convert certificate ID: missing API key or postcode');
+        log.warning('Cannot look up certificate number: missing API key or postcode');
         return null;
     }
     
-    log.info(`Converting old certificate ID ${oldLmkKey || 'unknown'} to new hash format via postcode lookup: ${postcode}`);
+    log.info(`Looking up certificate number via postcode: ${postcode}`);
     
     try {
         const apiBaseURL = 'https://epc.opendatacommunities.org/api/v1/domestic/search';
@@ -104,29 +86,26 @@ async function getNewCertificateHash(postcode, address, apiKey, oldLmkKey = null
         // Find best matching address
         const bestMatch = findBestAddressMatch(results, address);
         
-        if (bestMatch && bestMatch['lmk-key']) {
-            const newLmkKey = bestMatch['lmk-key'];
+        if (bestMatch && bestMatch['certificate-number']) {
+            const certificateNumber = bestMatch['certificate-number'];
             
-            // Verify it's the new format
-            if (!isOldCertificateFormat(newLmkKey)) {
-                log.info(`Successfully converted to new hash format: ${newLmkKey}`);
-                return newLmkKey;
+            // Verify it's the valid format
+            if (isValidCertificateNumber(certificateNumber)) {
+                log.info(`Found certificate number: ${certificateNumber}`);
+                return {
+                    certificateNumber: certificateNumber,
+                    lmkKey: bestMatch['lmk-key'],
+                    rating: bestMatch['current-energy-rating'],
+                    floorArea: bestMatch['total-floor-area']
+                };
             } else {
-                log.warning(`API returned old format certificate ID: ${newLmkKey}`);
-                // Try to find another result with new format
-                for (const result of results) {
-                    if (result['lmk-key'] && !isOldCertificateFormat(result['lmk-key'])) {
-                        log.info(`Found alternative new hash format: ${result['lmk-key']}`);
-                        return result['lmk-key'];
-                    }
-                }
-                return null;
+                log.warning(`Invalid certificate number format: ${certificateNumber}`);
             }
         }
         
         return null;
     } catch (error) {
-        log.warning(`Failed to get new certificate hash: ${error.message}`);
+        log.warning(`Failed to get certificate number: ${error.message}`);
         return null;
     }
 }
@@ -192,60 +171,35 @@ async function fetchEPCDataViaAPI(postcode, address, apiKey) {
         const bestMatch = findBestAddressMatch(results, address);
         
         if (bestMatch) {
-            let lmkKey = bestMatch['lmk-key'];
+            // CRITICAL FIX: Use 'certificate-number' field for certificate URLs
+            // NOT 'lmk-key' (64-char hash) - that causes 404 errors on the website
+            // certificate-number format: XXXX-XXXX-XXXX-XXXX-XXXX
+            const certificateNumber = bestMatch['certificate-number'];
+            const lmkKey = bestMatch['lmk-key']; // Keep for reference/logging only
             
-            // CRITICAL: Check if certificate ID is in old deprecated format
-            // Old format causes 404 errors on the EPC website
-            if (isOldCertificateFormat(lmkKey)) {
-                log.warning(`Certificate ID ${lmkKey} is in old format, attempting conversion...`);
-                
-                // Try to find a result with new hash format in the same response
-                const newFormatResult = results.find(r => 
-                    r['lmk-key'] && !isOldCertificateFormat(r['lmk-key'])
-                );
-                
-                if (newFormatResult) {
-                    // Use the address matching to find the correct one with new format
-                    const newFormatMatches = results.filter(r => 
-                        r['lmk-key'] && !isOldCertificateFormat(r['lmk-key'])
-                    );
-                    const bestNewMatch = findBestAddressMatch(newFormatMatches, address);
-                    if (bestNewMatch) {
-                        lmkKey = bestNewMatch['lmk-key'];
-                        log.info(`Converted to new hash format: ${lmkKey}`);
-                    } else {
-                        log.warning(`Could not find matching certificate in new format, using search URL instead`);
-                        return {
-                            rating: bestMatch['current-energy-rating'],
-                            searchURL: generateEPCSearchURL(postcode),
-                            floorArea: bestMatch['total-floor-area'],
-                            lmkKey: null,
-                            certificateURL: null,
-                            note: 'Certificate ID in deprecated format - use search link'
-                        };
-                    }
-                } else {
-                    // No new format available in API response - return search URL
-                    log.warning(`No certificates with new format found for ${postcode}`);
-                    return {
-                        rating: bestMatch['current-energy-rating'],
-                        searchURL: generateEPCSearchURL(postcode),
-                        floorArea: bestMatch['total-floor-area'],
-                        lmkKey: null,
-                        certificateURL: null,
-                        note: 'Certificate ID in deprecated format - use search link'
-                    };
-                }
+            if (!certificateNumber) {
+                log.warning(`No certificate-number found for ${address}, using search URL instead`);
+                return {
+                    rating: bestMatch['current-energy-rating'],
+                    searchURL: generateEPCSearchURL(postcode),
+                    floorArea: bestMatch['total-floor-area'],
+                    lmkKey: lmkKey,
+                    certificateNumber: null,
+                    certificateURL: null,
+                    note: 'Certificate number not available - use search link'
+                };
             }
             
             const epcData = {
                 rating: bestMatch['current-energy-rating'],
-                certificateURL: `https://find-energy-certificate.service.gov.uk/energy-certificate/${lmkKey}`,
+                certificateURL: `https://find-energy-certificate.service.gov.uk/energy-certificate/${certificateNumber}`,
                 floorArea: bestMatch['total-floor-area'],
-                lmkKey: lmkKey
+                lmkKey: lmkKey, // Keep for reference
+                certificateNumber: certificateNumber
             };
             
-            log.info(`Found EPC via API: Rating ${epcData.rating}, Certificate: ${epcData.certificateURL}`);
+            log.info(`Found EPC via API: Rating ${epcData.rating}, Certificate #: ${certificateNumber}`);
+            log.info(`Certificate URL: ${epcData.certificateURL}`);
             return epcData;
         } else {
             log.info('No matching address found in EPC API results');
@@ -400,6 +354,6 @@ module.exports = {
     generateEPCSearchURL,
     scrapeEPCData,
     createEPCLookupRow,
-    isOldCertificateFormat,
-    getNewCertificateHash
+    isValidCertificateNumber,
+    getCertificateNumber
 };
