@@ -105,9 +105,9 @@ async function scrapePropertyData(url) {
             }
             
             // Price per square foot (extract FIRST before floor area)
-            // Matches patterns like: "£93 per sq ft", "£132/sq ft", "£125 per sqft"
-            if (text.match(/£\s*[\d,]+\s*(per|\/)\s*sq\.?\s*ft/i)) {
-                const pricePerSqft = text.match(/£\s*([\d,]+)\s*(?:per|\/)\s*sq\.?\s*ft/i);
+            // Matches patterns like: "£93 per sq ft", "£93 per sq feet", "£132/sq ft", "£125 per sqft"
+            if (text.match(/£\s*[\d,]+\s*(per|\/)\s*sq\.?\s*f(?:ee)?t/i)) {
+                const pricePerSqft = text.match(/£\s*([\d,]+)\s*(?:per|\/)\s*sq\.?\s*f(?:ee)?t/i);
                 if (pricePerSqft) {
                     data['£/sqft'] = `£${pricePerSqft[1]}`;
                     log.debug(`Extracted £/sqft: ${data['£/sqft']} from text: ${text}`);
@@ -116,10 +116,11 @@ async function scrapePropertyData(url) {
             
             // Actual floor area (extract AFTER £/sqft to avoid confusion)
             // Use negative lookahead to exclude lines with currency symbols (£, $, €)
-            // Matches patterns like: "1200 sq ft", "Floor area: 950 sq ft", "1,200 sqft", "875 square feet"
+            // Matches patterns like: "1200 sq ft", "1200 sq feet", "Floor area: 950 sq ft", "1,200 sqft", "875 square feet"
             // Does NOT match: "£93 per sq ft" (already handled above)
-            if (text.match(/sq\.?\s*ft|square\s+feet|floor area/i) && !text.match(/[£$€]\s*[\d,]+/)) {
-                const sqft = text.match(/(?<![£$€])\b([\d,]+)\s*(?:sq\.?\s*ft|square\s+feet)/i);
+            // CRITICAL FIX: PropertyData uses "sq feet" not "sq ft", so pattern must match both
+            if (text.match(/sq\.?\s*f(?:ee)?t|square\s+feet|floor area|internal\s+area/i) && !text.match(/[£$€]\s*[\d,]+/)) {
+                const sqft = text.match(/(?<![£$€])\b([\d,]+)\s*(?:sq\.?\s*f(?:ee)?t|square\s+feet)/i);
                 if (sqft) {
                     const sqftValue = parseFloat(sqft[1].replace(/,/g, ''));
                     // Additional validation: floor area should be reasonable (50-10000 sq ft)
@@ -137,7 +138,7 @@ async function scrapePropertyData(url) {
             
             // Fallback for £/sqft
             if (!data['£/sqft']) {
-                const pricePerSqftMatch = bodyText.match(/£\s*([\d,]+)\s*(?:per|\/)\s*sq\.?\s*ft/i);
+                const pricePerSqftMatch = bodyText.match(/£\s*([\d,]+)\s*(?:per|\/)\s*sq\.?\s*f(?:ee)?t/i);
                 if (pricePerSqftMatch) {
                     data['£/sqft'] = `£${pricePerSqftMatch[1]}`;
                     log.debug(`Fallback: Extracted £/sqft: ${data['£/sqft']}`);
@@ -146,14 +147,14 @@ async function scrapePropertyData(url) {
             
             // Fallback for floor area (only if no currency symbol nearby)
             if (!data['Sq. ft']) {
-                // Look for patterns like "Floor area: 1200 sq ft" or just "1200 sq ft"
+                // Look for patterns like "Floor area: 1200 sq ft" or "Internal area: 1200 sq feet"
                 // Split body into lines to avoid matching across unrelated content
                 const lines = bodyText.split('\n');
                 for (const line of lines) {
                     // Skip lines with currency symbols
                     if (line.match(/[£$€]/)) continue;
                     
-                    const sqftMatch = line.match(/(?:floor\s*area|internal\s*area)?\s*:?\s*([\d,]+)\s*(?:sq\.?\s*ft|square\s+feet)/i);
+                    const sqftMatch = line.match(/(?:floor\s*area|internal\s*area)?\s*:?\s*([\d,]+)\s*(?:sq\.?\s*f(?:ee)?t|square\s+feet)/i);
                     if (sqftMatch) {
                         const sqftValue = parseFloat(sqftMatch[1].replace(/,/g, ''));
                         if (sqftValue >= 50 && sqftValue <= 10000) {
@@ -166,17 +167,55 @@ async function scrapePropertyData(url) {
             }
         }
 
-        // Calculate Sqm if Sq. ft is available
+        // Calculate Sqm if Sq. ft is available (Sqm = Sq. ft × 0.092903)
         if (data['Sq. ft'] && !isNaN(data['Sq. ft'])) {
-            data.Sqm = Math.round(data['Sq. ft'] * 0.092903); // 1 sq ft = 0.092903 sqm
+            data.Sqm = Math.round(data['Sq. ft'] * 0.092903 * 10) / 10; // 1 sq ft = 0.092903 sqm, rounded to 1 decimal
             log.debug(`Calculated Sqm: ${data.Sqm} from ${data['Sq. ft']} sq ft`);
         }
 
-        // Extract image
-        const imageUrl = $('img.property-image, .property-photo img, meta[property="og:image"]').first().attr('src') ||
-                        $('meta[property="og:image"]').attr('content');
+        // Extract property image from street-view URL
+        // PropertyData hero images are available at: /transaction-street-view/{ID}
+        // The street-view URL directly returns an image file (JPEG)
+        let imageUrl = null;
+        
+        try {
+            // Extract transaction ID from URL
+            // Example: https://propertydata.co.uk/transaction/36A61A95-0328-DEF2-E063-4704A8C046AE
+            const transactionIdMatch = url.match(/\/transaction\/([A-F0-9-]+)/i);
+            
+            if (transactionIdMatch) {
+                const transactionId = transactionIdMatch[1];
+                // Construct street-view URL with URL-encoded braces
+                // This URL directly returns the hero image (JPEG format)
+                const streetViewUrl = `https://propertydata.co.uk/transaction-street-view/%7B${transactionId}%7D`;
+                
+                log.debug(`Constructed street-view image URL: ${streetViewUrl}`);
+                
+                // Verify the image exists with a HEAD request (rate limited)
+                await rateLimitDelay();
+                const headResponse = await axios.head(streetViewUrl, {
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    },
+                    timeout: 10000
+                });
+                
+                // Check if response is an image
+                const contentType = headResponse.headers['content-type'];
+                if (contentType && contentType.includes('image')) {
+                    imageUrl = streetViewUrl;
+                    log.info(`Hero image available at: ${imageUrl}`);
+                } else {
+                    log.warning(`Street-view URL returned non-image content-type: ${contentType}`);
+                }
+            }
+        } catch (imageError) {
+            log.warning(`Could not fetch street-view image: ${imageError.message}`);
+        }
+        
+        // If image found, add to data
         if (imageUrl) {
-            data.Image_URL = imageUrl.startsWith('http') ? imageUrl : `https://lh7-us.googleusercontent.com/8FqRXHn5L7pxh5f4QewRSuYUqmoq6YsT8U_QFKl0VWVMwQmmeRqn1w8Vpr22OmesfnCYEuiNGRZj591HQobmSwrLBhALNrNsAWN4621XTXNIqcuh8ky-wZ8umPY5UXq7tQuszVkgNgFVOHyWBhq461c`;
+            data.Image_URL = imageUrl;
         }
 
         log.info(`Successfully scraped PropertyData: ${data.Address || 'Unknown address'}`);

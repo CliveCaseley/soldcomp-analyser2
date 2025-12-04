@@ -34,7 +34,13 @@ const { log } = require('apify');
  */
 
 /**
- * Detect and merge duplicate properties based on address + postcode
+ * Detect and merge duplicate properties based on address + postcode OR URL
+ * 
+ * CRITICAL FIX (v2.1): Enhanced Duplicate Detection
+ * - Primary: Address + Postcode matching (existing logic)
+ * - Fallback: URL-based matching for URL-only entries
+ * - Handles incomplete properties that lack address/postcode
+ * 
  * @param {Array<Object>} properties - Array of properties
  * @returns {Array<Object>} Deduplicated properties
  */
@@ -42,21 +48,50 @@ function detectAndMergeDuplicates(properties) {
     log.info('Detecting duplicates...');
     
     const uniqueProperties = [];
-    const seenKeys = new Set();
+    const seenKeys = new Map(); // Map of key -> index in uniqueProperties
+    const seenURLs = new Map(); // Map of URL -> index in uniqueProperties
     
     properties.forEach(property => {
-        const key = generatePropertyKey(property);
+        let isDuplicate = false;
+        let existingIndex = -1;
         
-        if (seenKeys.has(key)) {
-            // Find existing property and merge
-            const existingIndex = uniqueProperties.findIndex(p => generatePropertyKey(p) === key);
-            if (existingIndex !== -1) {
-                log.info(`Found duplicate: ${property.Address}, ${property.Postcode}`);
-                uniqueProperties[existingIndex] = mergeProperties(uniqueProperties[existingIndex], property);
+        // Strategy 1: Try address + postcode based detection
+        const addressKey = generatePropertyKey(property);
+        
+        // Only use address key if it has meaningful data (not just "|")
+        if (addressKey && addressKey !== '|' && addressKey.length > 1) {
+            if (seenKeys.has(addressKey)) {
+                isDuplicate = true;
+                existingIndex = seenKeys.get(addressKey);
+                log.info(`Found duplicate (address): ${property.Address || 'No address'}, ${property.Postcode || 'No postcode'}`);
             }
+        }
+        
+        // Strategy 2: Try URL-based detection (fallback for URL-only entries)
+        if (!isDuplicate && property.URL) {
+            const urlKey = normalizeURL(property.URL);
+            if (seenURLs.has(urlKey)) {
+                isDuplicate = true;
+                existingIndex = seenURLs.get(urlKey);
+                log.info(`Found duplicate (URL): ${property.URL}`);
+            }
+        }
+        
+        if (isDuplicate && existingIndex !== -1) {
+            // Merge with existing property
+            uniqueProperties[existingIndex] = mergeProperties(uniqueProperties[existingIndex], property);
         } else {
-            seenKeys.add(key);
+            // Add as new unique property
+            const newIndex = uniqueProperties.length;
             uniqueProperties.push(property);
+            
+            // Register keys
+            if (addressKey && addressKey !== '|' && addressKey.length > 1) {
+                seenKeys.set(addressKey, newIndex);
+            }
+            if (property.URL) {
+                seenURLs.set(normalizeURL(property.URL), newIndex);
+            }
         }
     });
     
@@ -64,6 +99,22 @@ function detectAndMergeDuplicates(properties) {
     log.info(`Removed ${duplicatesRemoved} duplicates. ${uniqueProperties.length} unique properties remaining.`);
     
     return uniqueProperties;
+}
+
+/**
+ * Normalize URL for consistent comparison
+ * @param {string} url - URL to normalize
+ * @returns {string} Normalized URL
+ */
+function normalizeURL(url) {
+    if (!url) return '';
+    
+    // Convert to lowercase, remove trailing slashes, normalize protocol
+    let normalized = url.toLowerCase().trim();
+    normalized = normalized.replace(/\/$/, ''); // Remove trailing slash
+    normalized = normalized.replace(/^https?:\/\//, ''); // Remove protocol for comparison
+    
+    return normalized;
 }
 
 /**

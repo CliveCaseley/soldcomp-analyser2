@@ -1,6 +1,6 @@
 {
   "name": "soldcomp-analyser2",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "description": "Apify Actor to process property sales data, enrich with external data, and produce ranked list of comparable properties",
   "main": "src/main.js",
   "scripts": {

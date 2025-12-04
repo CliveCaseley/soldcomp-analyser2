@@ -11,6 +11,7 @@ const { rankProperties } = require('./utils/rankingEngine');
 const { detectAndMergeDuplicates } = require('./utils/duplicateDetector');
 const { addHyperlinks } = require('./utils/excelHelper');
 const { readCSVFromKVS, writeCSVToKVS } = require('./utils/kvsHandler');
+const { sanitizeProperties } = require('./utils/dataSanitizer');
 
 /**
  * Main actor entry point
@@ -50,6 +51,10 @@ Actor.main(async () => {
         log.info('=== STEP 3: Cleaning and normalizing data ===');
         properties = properties.map(cleanProperty);
         
+        // Step 4.5: Sanitize data (remove JS/HTML garbage, validate values)
+        log.info('=== STEP 3.5: Sanitizing data (removing JS/HTML, validating values) ===');
+        properties = sanitizeProperties(properties);
+        
         // Step 5: Find target property (CRITICAL)
         log.info('=== STEP 4: Finding target property ===');
         const { target, comparables } = findTarget(properties);
@@ -74,6 +79,10 @@ Actor.main(async () => {
         let allProperties = mergeScrapedData(comparables, scrapedProperties);
         log.info(`Total properties after merging: ${allProperties.length}`);
         
+        // Step 8.5: Sanitize scraped data (remove JS/HTML from scraped content)
+        log.info('=== STEP 7.5: Sanitizing scraped data ===');
+        allProperties = sanitizeProperties(allProperties);
+        
         // Step 9: Detect and merge duplicates
         log.info('=== STEP 8: Detecting duplicates ===');
         allProperties = detectAndMergeDuplicates(allProperties);
@@ -88,7 +97,12 @@ Actor.main(async () => {
         
         // Step 11: Enrich with EPC data
         log.info('=== STEP 10: Enriching with EPC data ===');
-        await enrichWithEPCData(allProperties);
+        await enrichWithEPCData(allProperties, EPC_API_KEY);
+        
+        // Step 11.5: Final data processing - ensure Sqm calculated for ALL properties
+        log.info('=== STEP 10.5: Final data processing (Sqm calculation) ===');
+        finalizePropertyData(allProperties);
+        finalizePropertyData([target]); // Also finalize target
         
         // Step 12: Rank comparable properties
         log.info('=== STEP 11: Ranking comparable properties ===');
@@ -117,11 +131,20 @@ Actor.main(async () => {
 
 /**
  * Scrape all classified URLs
+ * 
+ * FIX 4: Custom Rightmove Scraper (Direct HTTP with Cheerio)
+ * - Uses direct HTTP scraping (no paid subscription required)
+ * - Extracts: address, sold date, price, property type, bedrooms, bathrooms
+ * - Handles errors gracefully with fallback values
+ * - Addresses Issue #6: Rightmove URLs not scraped
+ * 
  * @param {Object} classifiedURLs - Classified URLs by type
  * @returns {Array<Object>} Scraped properties
  */
 async function scrapeAllURLs(classifiedURLs) {
     const scrapedProperties = [];
+    
+    log.info('Rightmove scraping mode: Direct HTTP with Cheerio');
     
     // Scrape Rightmove postcode searches
     for (const { url } of classifiedURLs[URL_TYPES.RIGHTMOVE_POSTCODE_SEARCH]) {
@@ -170,6 +193,11 @@ function mergeScrapedData(existing, scraped) {
 
 /**
  * Geocode properties and calculate distances from target
+ * 
+ * CRITICAL FIX (v2.1): Latitude and Longitude Output
+ * - Now maps geocoded coordinates to output columns (Latitude, Longitude)
+ * - Previously stored in _geocode internal field only
+ * 
  * @param {Array<Object>} properties - Properties to geocode
  * @param {Object} target - Target property
  * @param {string} apiKey - Google API key
@@ -185,7 +213,11 @@ async function geocodeAndCalculateDistances(properties, target, apiKey) {
     }
     
     target._geocode = targetGeocode;
-    target['Google Streetview URL'] = generateStreetviewURL(targetGeocode.lat, targetGeocode.lng);
+    target.Latitude = targetGeocode.lat;
+    target.Longitude = targetGeocode.lng;
+    const targetStreetviewURL = generateStreetviewURL(targetGeocode.lat, targetGeocode.lng);
+    target['Google Streetview URL'] = targetStreetviewURL;
+    target['Google Streetview Link'] = `=HYPERLINK("${targetStreetviewURL}", "View Map")`;
     
     // Geocode all comparable properties
     for (const property of properties) {
@@ -199,7 +231,11 @@ async function geocodeAndCalculateDistances(properties, target, apiKey) {
         
         if (geocode) {
             property._geocode = geocode;
-            property['Google Streetview URL'] = generateStreetviewURL(geocode.lat, geocode.lng);
+            property.Latitude = geocode.lat;
+            property.Longitude = geocode.lng;
+            const streetviewURL = generateStreetviewURL(geocode.lat, geocode.lng);
+            property['Google Streetview URL'] = streetviewURL;
+            property['Google Streetview Link'] = `=HYPERLINK("${streetviewURL}", "View Map")`;
             
             // Calculate distance from target
             const distance = calculateDistance(
@@ -212,7 +248,7 @@ async function geocodeAndCalculateDistances(properties, target, apiKey) {
             property._distanceValue = distance; // Store numeric value for ranking
             property.Distance = formatDistance(distance);
             
-            log.info(`  ${property.Address}: ${property.Distance}`);
+            log.info(`  ${property.Address}: ${property.Distance} (${geocode.lat}, ${geocode.lng})`);
         } else {
             log.warning(`Failed to geocode: ${property.Address}, ${property.Postcode}`);
             property.needs_review = 1;
@@ -222,21 +258,85 @@ async function geocodeAndCalculateDistances(properties, target, apiKey) {
 
 /**
  * Enrich properties with EPC data
+ * 
+ * CRITICAL FIX (v2.1): EPC API Integration with Certificate URLs
+ * - Now uses EPC API with authentication
+ * - Populates both 'EPC rating' and 'EPC Certificate' columns
+ * - Certificate column contains individual property certificate URLs
+ * 
  * @param {Array<Object>} properties - Properties to enrich
+ * @param {string} apiKey - EPC API key
  */
-async function enrichWithEPCData(properties) {
+async function enrichWithEPCData(properties, apiKey) {
     for (const property of properties) {
         if (!property.Postcode) continue;
         
         try {
-            const epcData = await scrapeEPCData(property.Postcode, property.Address);
-            if (epcData && epcData.rating) {
-                property['EPC rating'] = epcData.rating;
+            const epcData = await scrapeEPCData(property.Postcode, property.Address, apiKey);
+            
+            if (epcData) {
+                // Store EPC rating
+                if (epcData.rating) {
+                    property['EPC rating'] = epcData.rating;
+                }
+                
+                // Store individual certificate URL in dedicated column
+                if (epcData.certificateURL) {
+                    property['EPC Certificate'] = epcData.certificateURL;
+                    log.info(`  EPC Certificate URL: ${epcData.certificateURL}`);
+                }
+                
+                // Use floor area from EPC if property doesn't have it
+                if (epcData.floorArea && !property['Sq. ft']) {
+                    // EPC floor area is in sq meters, convert to sq ft
+                    const sqFt = Math.round(epcData.floorArea / 0.092903);
+                    property['Sq. ft'] = sqFt;
+                    property.Sqm = epcData.floorArea;
+                    log.info(`  Using EPC floor area: ${sqFt} sq ft (${epcData.floorArea} sqm)`);
+                }
             }
         } catch (error) {
             log.warning(`Failed to fetch EPC data for ${property.Address}: ${error.message}`);
         }
     }
+}
+
+/**
+ * Final data processing - ensure all calculated fields are present
+ * 
+ * CRITICAL FIX (v2.1): Sqm Calculation for ALL Properties
+ * - Runs after all scraping and enrichment completes
+ * - Calculates Sqm from Sq. ft for ANY property that has floor area
+ * - Previously only calculated during CSV parsing or PropertyData scraping
+ * 
+ * @param {Array<Object>} properties - Properties to finalize
+ */
+function finalizePropertyData(properties) {
+    let sqmCalculated = 0;
+    
+    for (const property of properties) {
+        // Calculate Sqm from Sq. ft if missing
+        if (property['Sq. ft'] && !property.Sqm) {
+            const sqft = parseFloat(property['Sq. ft']);
+            if (!isNaN(sqft) && sqft > 0) {
+                property.Sqm = Math.round(sqft * 0.092903); // 1 sq ft = 0.092903 sqm
+                sqmCalculated++;
+                log.info(`Calculated Sqm for ${property.Address || 'property'}: ${property.Sqm} sqm (from ${sqft} sq ft)`);
+            }
+        }
+        
+        // Calculate £/sqft from Price and Sq. ft if missing
+        if (property.Price && property['Sq. ft'] && !property['£/sqft']) {
+            const price = parseFloat(property.Price);
+            const sqft = parseFloat(property['Sq. ft']);
+            if (!isNaN(price) && !isNaN(sqft) && sqft > 0) {
+                property['£/sqft'] = Math.round(price / sqft);
+                log.info(`Calculated £/sqft for ${property.Address || 'property'}: £${property['£/sqft']}`);
+            }
+        }
+    }
+    
+    log.info(`Final data processing: Calculated Sqm for ${sqmCalculated} properties`);
 }
 
 /**

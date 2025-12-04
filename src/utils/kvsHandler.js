@@ -35,6 +35,33 @@ async function readCSVFromKVS(storeName, key) {
 }
 
 /**
+ * Check if a row is completely empty (all critical fields are null/undefined/empty)
+ * @param {Object} row - Property row object
+ * @returns {boolean} true if row is completely empty
+ */
+function isEmptyRow(row) {
+    // Critical fields that should have values in a valid row
+    const criticalFields = [
+        'Date of sale',
+        'Address',
+        'Postcode',
+        'Type',
+        'Price',
+        'URL'
+    ];
+    
+    // Check if all critical fields are empty
+    return criticalFields.every(field => {
+        const value = row[field];
+        return value === null || 
+               value === undefined || 
+               value === '' || 
+               value === 'nan' ||
+               (typeof value === 'number' && isNaN(value));
+    });
+}
+
+/**
  * Write CSV to Apify Key-Value Store
  * @param {Array<Object>} properties - Array of property objects
  * @param {string} storeName - KVS store name
@@ -44,8 +71,16 @@ async function writeCSVToKVS(properties, storeName, key) {
     log.info(`Writing ${properties.length} properties to KVS: ${storeName}/${key}`);
     
     try {
+        // Filter out completely empty rows
+        const filteredProperties = properties.filter(row => !isEmptyRow(row));
+        const removedCount = properties.length - filteredProperties.length;
+        
+        if (removedCount > 0) {
+            log.info(`Removed ${removedCount} empty duplicate rows from output`);
+        }
+        
         // Convert properties to CSV
-        const csv = stringify(properties, {
+        const csv = stringify(filteredProperties, {
             header: true,
             columns: STANDARD_HEADERS
         });
@@ -56,7 +91,7 @@ async function writeCSVToKVS(properties, storeName, key) {
         // Save the CSV
         await store.setValue(key, csv, { contentType: 'text/csv' });
         
-        log.info(`Successfully wrote CSV to KVS (${csv.length} bytes)`);
+        log.info(`Successfully wrote CSV to KVS (${csv.length} bytes, ${filteredProperties.length} rows)`);
     } catch (error) {
         log.error(`Failed to write to KVS: ${error.message}`);
         throw error;

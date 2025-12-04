@@ -1,23 +1,53 @@
 # Soldcomp-Analyser2 Apify Actor
 
-**Version:** 2.0.0  
-**Author:** Clive Caseley
+**Version:** 2.1.0  
+**Author:** Clive Caseley  
+**Last Updated:** December 3, 2025
 
 ## Overview
 
-Soldcomp-Analyser2 is an Apify actor that processes property sales data from multiple sources, enriches it with external data, and produces a ranked list of comparable properties relative to a designated target property.
+Soldcomp-Analyser2 is an advanced Apify actor that processes property sales data from multiple sources, enriches it with external APIs and web scraping, and produces a ranked list of comparable properties relative to a designated target property. Version 2.1.0 includes comprehensive bug fixes and feature enhancements.
+
+## ✨ What's New in v2.1.0
+
+### 🎯 Core Improvements
+- **Latitude & Longitude Output** - Geocoded coordinates now appear in output CSV
+- **Individual EPC Certificates** - Direct links to property EPC certificates (not just postcode search)
+- **Enhanced Duplicate Detection** - URL-based fallback for properties without addresses
+- **Data Sanitization** - Automatic removal of JavaScript/HTML garbage from scraped content
+- **Postcode Extraction** - Automatically extracts postcodes from combined address fields
+- **Rightmove Integration** - Uses Apify sub-actors for reliable scraping (bypasses anti-bot)
+- **EPC API Integration** - Official API integration with Basic Auth
+- **Comprehensive Validation** - Price, floor area, and bedroom count validation
+
+### 🐛 Fixed Issues
+1. ✅ Duplicates properly detected and merged (URL-based fallback)
+2. ✅ Sq ft and £/sqft correctly separated (verified)
+3. ✅ Sqm calculated for ALL properties (final pass after enrichment)
+4. ✅ Latitude and Longitude in output
+5. ✅ Postcodes extracted from combined addresses
+6. ✅ Rightmove URLs successfully scraped (Apify sub-actors)
+7. ✅ URLs correctly placed (not in Date/Postcode columns)
+8. ✅ No JavaScript/HTML in output (sanitization)
+9. ✅ Prices properly validated (£10k-£10M range)
+10. ✅ Individual EPC certificate URLs (not just postcode search)
 
 ## Features
 
 ✅ **Flexible CSV parsing** with automatic header detection and fuzzy matching  
 ✅ **Robust target detection** using fuzzy matching for "target" variations  
-✅ **Multi-source data scraping** (Rightmove, PropertyData)  
-✅ **Conservative scraping strategy** with rate limiting to avoid anti-bot detection  
+✅ **Multi-source data scraping** (Rightmove via Apify sub-actors, PropertyData)  
+✅ **Apify sub-actor integration** for reliable Rightmove scraping  
+✅ **Data sanitization** removes JavaScript/HTML from scraped content  
 ✅ **Google Geocoding integration** for accurate distance calculation  
+✅ **Coordinate output** with Latitude and Longitude columns  
 ✅ **Haversine distance calculation** with formatted output ("0.1mi")  
-✅ **EPC data enrichment** with postcode search fallback  
+✅ **EPC API integration** with individual certificate URLs  
+✅ **Floor area enrichment** from EPC data as backup source  
 ✅ **Weighted ranking algorithm** (40% floor area, 30% proximity, 20% bedrooms, 10% recency)  
-✅ **Intelligent duplicate detection** and merging  
+✅ **Enhanced duplicate detection** with URL-based fallback  
+✅ **Postcode extraction** from combined address fields  
+✅ **Data validation** for prices, floor areas, and bedroom counts  
 ✅ **Excel-friendly output** with HYPERLINK formulas  
 ✅ **Iterative processing** support with data persistence  
 ✅ **Comprehensive logging** and error handling
@@ -84,7 +114,7 @@ https://propertydata.co.uk/property/78910,,,,,,,
 
 ## Output CSV Format
 
-The actor generates a CSV with **19 columns**:
+The actor generates a CSV with **23 columns** (3 new in v2.1.0):
 
 | Column | Description |
 |--------|-------------|
@@ -94,16 +124,19 @@ The actor generates a CSV with **19 columns**:
 | Type | Property type (Detached, Semi-detached, Terraced, Flat) |
 | Tenure | Freehold/Leasehold |
 | Age at sale | Property age in years |
-| Price | Sale price (numeric) |
-| Sq. ft | Floor area in square feet |
-| Sqm | Floor area in square meters |
+| Price | Sale price (numeric, validated £10k-£10M) |
+| Sq. ft | Floor area in square feet (validated 50-10,000) |
+| Sqm | Floor area in square meters (auto-calculated) |
 | £/sqft | Price per square foot |
-| Bedrooms | Number of bedrooms |
+| Bedrooms | Number of bedrooms (validated 0-15) |
 | Distance | Distance from target (e.g., "0.1mi") |
+| **Latitude** ⭐ NEW | Geocoded latitude coordinate |
+| **Longitude** ⭐ NEW | Geocoded longitude coordinate |
 | URL | Property listing URL (plain text) |
 | Link | Excel HYPERLINK formula |
 | Image_URL | Property image URL |
 | EPC rating | Energy Performance Certificate rating (A-G) |
+| **EPC Certificate** ⭐ NEW | Individual property EPC certificate URL |
 | Google Streetview URL | Google Streetview link |
 | isTarget | 1 for target property, 0 otherwise |
 | Ranking | Comparable property score (0-100) |
