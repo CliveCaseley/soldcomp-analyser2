@@ -46,8 +46,9 @@ async function fetchEPCDataViaAPI(postcode, address, apiKey) {
         // Prepare authentication (Basic Auth with email:apikey)
         // The API requires email address as username and API key as password
         // Format: Authorization: Basic base64(email:apikey)
-        // Since we only have apiKey, we'll try common patterns or use a placeholder email
-        const auth = Buffer.from(`user@example.com:${apiKey}`).toString('base64');
+        // Use EPC_EMAIL environment variable, fallback to placeholder if not set
+        const email = process.env.EPC_EMAIL || 'user@example.com';
+        const auth = Buffer.from(`${email}:${apiKey}`).toString('base64');
         
         // Search by postcode
         const params = {
