@@ -44,8 +44,10 @@ Actor.main(async () => {
         
         // Step 3: Parse CSV with flexible header detection
         log.info('=== STEP 2: Parsing CSV ===');
-        let properties = parseCSV(csvContent);
-        log.info(`Parsed ${properties.length} properties`);
+        const parseResult = parseCSV(csvContent);
+        let properties = parseResult.normalizedData;
+        const preHeaderRows = parseResult.preHeaderRows;
+        log.info(`Parsed ${properties.length} properties and ${preHeaderRows.length} pre-header rows`);
         
         // Step 4: Clean and normalize properties
         log.info('=== STEP 3: Cleaning and normalizing data ===');
@@ -57,7 +59,7 @@ Actor.main(async () => {
         
         // Step 5: Find target property (CRITICAL)
         log.info('=== STEP 4: Finding target property ===');
-        const { target, comparables } = findTarget(properties);
+        const { target, comparables } = findTarget(properties, preHeaderRows);
         log.info(`Target property: ${target.Address}, ${target.Postcode}`);
         log.info(`Comparable properties: ${comparables.length}`);
         
