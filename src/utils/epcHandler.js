@@ -3,20 +3,21 @@ const cheerio = require('cheerio');
 const { log } = require('apify');
 
 /**
- * EPC API HANDLER
+ * EPC HANDLER - Web Scraping Approach
  * 
- * CRITICAL FIX (v2.1): Proper EPC API Integration
- * - Uses official EPC API with authentication
- * - Provides individual property EPC certificate URLs
- * - Falls back to web scraping if API unavailable
- * - Addresses Issue #10: EPC link misplacement
+ * CRITICAL FIX (v2.5): Direct Web Scraping of Certificate Numbers
+ * - Bypasses the API entirely (API often doesn't return certificate-number)
+ * - Scrapes postcode search page directly: https://find-energy-certificate.service.gov.uk/find-a-certificate/search-by-postcode?postcode={postcode}
+ * - Extracts certificate numbers from href attributes: /energy-certificate/XXXX-XXXX-XXXX-XXXX-XXXX
+ * - Matches by address to find the correct certificate
+ * - More reliable than API which has missing certificate-number fields
  * 
- * CRITICAL FIX (v2.3): Certificate Number URL Format
- * - EPC certificate URLs use 'certificate-number' field (format: XXXX-XXXX-XXXX-XXXX-XXXX)
- * - NOT 'lmk-key' (64-char hash) which causes 404 errors on the website
- * - URL format: https://find-energy-certificate.service.gov.uk/energy-certificate/{certificate-number}
+ * Previous versions:
+ * - v2.1: Proper EPC API Integration
+ * - v2.3: Certificate Number URL Format (using certificate-number not lmk-key)
+ * - v2.4: Two-Step Certificate Number Retrieval (search API + individual certificate API)
  * 
- * API Documentation: https://epc.opendatacommunities.org/docs/api
+ * API Documentation (deprecated for this implementation): https://epc.opendatacommunities.org/docs/api
  */
 
 /**
@@ -43,71 +44,167 @@ function isValidCertificateNumber(certificateNumber) {
 }
 
 /**
- * Get certificate number by looking up via postcode
- * @param {string} postcode - Property postcode
- * @param {string} address - Property address for matching
- * @param {string} apiKey - EPC API key
- * @returns {Promise<Object|null>} Certificate data with number or null
+ * Scrape certificate numbers from postcode search page (NEW APPROACH - v2.5)
+ * This bypasses the API entirely and scrapes directly from the web interface
+ * The web interface provides direct links to certificates with certificate numbers in href
+ * 
+ * @param {string} postcode - Property postcode to search
+ * @returns {Promise<Array>} Array of {certificateNumber, address, href, rating} objects
  */
-async function getCertificateNumber(postcode, address, apiKey) {
-    if (!apiKey || !postcode) {
-        log.warning('Cannot look up certificate number: missing API key or postcode');
-        return null;
+async function scrapeCertificateNumbersFromPostcode(postcode) {
+    if (!postcode) {
+        log.warning('Cannot scrape certificates: missing postcode');
+        return [];
     }
     
-    log.info(`Looking up certificate number via postcode: ${postcode}`);
+    log.info(`Scraping certificate numbers from postcode search page: ${postcode}`);
     
     try {
-        const apiBaseURL = 'https://epc.opendatacommunities.org/api/v1/domestic/search';
-        const email = process.env.EPC_EMAIL || 'user@example.com';
-        const auth = Buffer.from(`${email}:${apiKey}`).toString('base64');
+        const cleanPostcode = postcode.replace(/\s+/g, '');
+        const searchURL = `https://find-energy-certificate.service.gov.uk/find-a-certificate/search-by-postcode?postcode=${cleanPostcode}`;
         
-        const params = {
-            postcode: postcode.replace(/\s+/g, ''),
-            size: 20 // Get more results for better matching
-        };
-        
-        const response = await axios.get(apiBaseURL, {
-            params,
+        const response = await axios.get(searchURL, {
             headers: {
-                'Authorization': `Basic ${auth}`,
-                'Accept': 'application/json'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             },
             timeout: 10000
         });
         
-        if (!response.data || !response.data.rows || response.data.rows.length === 0) {
-            log.warning('No EPC data found for postcode lookup');
+        const $ = cheerio.load(response.data);
+        const certificates = [];
+        
+        // Find all certificate links - they have format: href="/energy-certificate/XXXX-XXXX-XXXX-XXXX-XXXX"
+        $('a.govuk-link[href^="/energy-certificate/"]').each((i, elem) => {
+            const href = $(elem).attr('href');
+            const address = $(elem).text().trim();
+            
+            // Extract certificate number from href
+            // Format: /energy-certificate/2648-3961-7260-5043-7964
+            const match = href.match(/\/energy-certificate\/([A-Z0-9-]+)/i);
+            
+            if (match && match[1]) {
+                const certificateNumber = match[1];
+                
+                if (isValidCertificateNumber(certificateNumber)) {
+                    // Try to find rating if available on the page
+                    let rating = null;
+                    const parent = $(elem).closest('.govuk-summary-list__row, .search-result');
+                    if (parent.length > 0) {
+                        const ratingText = parent.find('.govuk-tag, .energy-rating').text().trim();
+                        if (ratingText && /^[A-G]$/i.test(ratingText)) {
+                            rating = ratingText.toUpperCase();
+                        }
+                    }
+                    
+                    certificates.push({
+                        certificateNumber: certificateNumber,
+                        address: address,
+                        href: `https://find-energy-certificate.service.gov.uk${href}`,
+                        rating: rating
+                    });
+                    
+                    log.info(`Found certificate: ${certificateNumber} for ${address}`);
+                }
+            }
+        });
+        
+        log.info(`Scraped ${certificates.length} certificates from postcode search page`);
+        return certificates;
+        
+    } catch (error) {
+        log.warning(`Failed to scrape certificate numbers: ${error.message}`);
+        return [];
+    }
+}
+
+
+/**
+ * Get certificate number by scraping postcode search page
+ * Uses web scraping approach to extract certificate numbers from href attributes
+ * 
+ * @param {string} postcode - Property postcode
+ * @param {string} address - Property address for matching
+ * @param {string} apiKey - EPC API key (optional, kept for compatibility but not used)
+ * @returns {Promise<Object|null>} Certificate data with number or null
+ */
+async function getCertificateNumber(postcode, address, apiKey = null) {
+    if (!postcode) {
+        log.warning('Cannot look up certificate number: missing postcode');
+        return null;
+    }
+    
+    log.info(`Looking up certificate number via web scraping: ${postcode}`);
+    
+    try {
+        // Scrape certificate numbers from postcode search page
+        const certificates = await scrapeCertificateNumbersFromPostcode(postcode);
+        
+        if (certificates.length === 0) {
+            log.warning('No certificates found for postcode');
             return null;
         }
         
-        const results = response.data.rows;
-        
         // Find best matching address
-        const bestMatch = findBestAddressMatch(results, address);
+        const bestMatch = findBestAddressMatchFromScrapedData(certificates, address);
         
-        if (bestMatch && bestMatch['certificate-number']) {
-            const certificateNumber = bestMatch['certificate-number'];
-            
-            // Verify it's the valid format
-            if (isValidCertificateNumber(certificateNumber)) {
-                log.info(`Found certificate number: ${certificateNumber}`);
-                return {
-                    certificateNumber: certificateNumber,
-                    lmkKey: bestMatch['lmk-key'],
-                    rating: bestMatch['current-energy-rating'],
-                    floorArea: bestMatch['total-floor-area']
-                };
-            } else {
-                log.warning(`Invalid certificate number format: ${certificateNumber}`);
-            }
+        if (bestMatch) {
+            log.info(`Found matching certificate: ${bestMatch.certificateNumber} for ${bestMatch.address}`);
+            return {
+                certificateNumber: bestMatch.certificateNumber,
+                certificateURL: bestMatch.href,
+                rating: bestMatch.rating,
+                address: bestMatch.address
+            };
         }
         
-        return null;
+        // If no good match, return first result as fallback
+        log.info('No exact address match, returning first result as fallback');
+        const fallback = certificates[0];
+        return {
+            certificateNumber: fallback.certificateNumber,
+            certificateURL: fallback.href,
+            rating: fallback.rating,
+            address: fallback.address
+        };
+        
     } catch (error) {
         log.warning(`Failed to get certificate number: ${error.message}`);
         return null;
     }
+}
+
+/**
+ * Find best matching address from scraped certificate data
+ * @param {Array} certificates - Array of certificate objects from scraping
+ * @param {string} targetAddress - Target address to match
+ * @returns {Object} Best matching certificate or null
+ */
+function findBestAddressMatchFromScrapedData(certificates, targetAddress) {
+    if (!targetAddress || !certificates || certificates.length === 0) {
+        return certificates[0]; // Return first result if no address to match
+    }
+    
+    const normalizedTarget = targetAddress.toLowerCase().trim();
+    let bestMatch = null;
+    let bestScore = 0;
+    
+    for (const cert of certificates) {
+        const certAddress = cert.address.toLowerCase().trim();
+        
+        // Simple scoring: count matching words
+        const targetWords = normalizedTarget.split(/\s+/);
+        const certWords = certAddress.split(/\s+/);
+        const matches = targetWords.filter(word => certWords.includes(word)).length;
+        const score = matches / targetWords.length;
+        
+        if (score > bestScore) {
+            bestScore = score;
+            bestMatch = cert;
+        }
+    }
+    
+    // Only return match if score > 50%
+    return bestScore > 0.5 ? bestMatch : certificates[0];
 }
 
 /**
@@ -121,94 +218,39 @@ function generateEPCSearchURL(postcode) {
 }
 
 /**
- * Fetch EPC data using official API
+ * Fetch EPC data using web scraping (NEW APPROACH - v2.5)
+ * Uses web scraping to extract certificate numbers directly from postcode search page
+ * This is more reliable than the API which often doesn't return certificate-number
+ * 
  * @param {string} postcode - Property postcode
  * @param {string} address - Property address
- * @param {string} apiKey - EPC API key
+ * @param {string} apiKey - EPC API key (optional, kept for compatibility but not used)
  * @returns {Object} EPC data with certificate URL, rating, floor area
  */
-async function fetchEPCDataViaAPI(postcode, address, apiKey) {
-    if (!apiKey) {
-        log.warning('EPC_API_KEY not set, skipping API call');
-        return null;
-    }
-    
-    log.info(`Fetching EPC data via API for: ${address}, ${postcode}`);
+async function fetchEPCDataViaAPI(postcode, address, apiKey = null) {
+    log.info(`Fetching EPC data via web scraping for: ${address}, ${postcode}`);
     
     try {
-        // EPC API endpoint for domestic properties
-        const apiBaseURL = 'https://epc.opendatacommunities.org/api/v1/domestic/search';
+        // Use web scraping to get certificate data
+        const certData = await getCertificateNumber(postcode, address, apiKey);
         
-        // Prepare authentication (Basic Auth with email:apikey)
-        // The API requires email address as username and API key as password
-        // Format: Authorization: Basic base64(email:apikey)
-        // Use EPC_EMAIL environment variable, fallback to placeholder if not set
-        const email = process.env.EPC_EMAIL || 'user@example.com';
-        const auth = Buffer.from(`${email}:${apiKey}`).toString('base64');
-        
-        // Search by postcode
-        const params = {
-            postcode: postcode.replace(/\s+/g, ''),
-            size: 10 // Limit results
-        };
-        
-        const response = await axios.get(apiBaseURL, {
-            params,
-            headers: {
-                'Authorization': `Basic ${auth}`,
-                'Accept': 'application/json'
-            },
-            timeout: 10000
-        });
-        
-        if (!response.data || !response.data.rows || response.data.rows.length === 0) {
-            log.info('No EPC data found via API');
-            return null;
-        }
-        
-        // Find best matching address
-        const results = response.data.rows;
-        const bestMatch = findBestAddressMatch(results, address);
-        
-        if (bestMatch) {
-            // CRITICAL FIX: Use 'certificate-number' field for certificate URLs
-            // NOT 'lmk-key' (64-char hash) - that causes 404 errors on the website
-            // certificate-number format: XXXX-XXXX-XXXX-XXXX-XXXX
-            const certificateNumber = bestMatch['certificate-number'];
-            const lmkKey = bestMatch['lmk-key']; // Keep for reference/logging only
-            
-            if (!certificateNumber) {
-                log.warning(`No certificate-number found for ${address}, using search URL instead`);
-                return {
-                    rating: bestMatch['current-energy-rating'],
-                    searchURL: generateEPCSearchURL(postcode),
-                    floorArea: bestMatch['total-floor-area'],
-                    lmkKey: lmkKey,
-                    certificateNumber: null,
-                    certificateURL: null,
-                    note: 'Certificate number not available - use search link'
-                };
-            }
-            
-            const epcData = {
-                rating: bestMatch['current-energy-rating'],
-                certificateURL: `https://find-energy-certificate.service.gov.uk/energy-certificate/${certificateNumber}`,
-                floorArea: bestMatch['total-floor-area'],
-                lmkKey: lmkKey, // Keep for reference
-                certificateNumber: certificateNumber
+        if (certData) {
+            log.info(`Found EPC via web scraping: Rating ${certData.rating || 'N/A'}, Certificate #: ${certData.certificateNumber}`);
+            log.info(`Certificate URL: ${certData.certificateURL}`);
+            return {
+                rating: certData.rating,
+                certificateURL: certData.certificateURL,
+                certificateNumber: certData.certificateNumber,
+                floorArea: null // Floor area not available from scraping
             };
-            
-            log.info(`Found EPC via API: Rating ${epcData.rating}, Certificate #: ${certificateNumber}`);
-            log.info(`Certificate URL: ${epcData.certificateURL}`);
-            return epcData;
         } else {
-            log.info('No matching address found in EPC API results');
-            return null;
+            log.info('No EPC data found via web scraping');
+            return { searchURL: generateEPCSearchURL(postcode) };
         }
         
     } catch (error) {
-        log.warning(`EPC API call failed: ${error.message}`);
-        return null;
+        log.warning(`EPC web scraping failed: ${error.message}`);
+        return { searchURL: generateEPCSearchURL(postcode) };
     }
 }
 
@@ -355,5 +397,7 @@ module.exports = {
     scrapeEPCData,
     createEPCLookupRow,
     isValidCertificateNumber,
-    getCertificateNumber
+    getCertificateNumber,
+    scrapeCertificateNumbersFromPostcode,
+    findBestAddressMatchFromScrapedData
 };
