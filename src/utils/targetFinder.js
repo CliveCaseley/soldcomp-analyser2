@@ -1,5 +1,6 @@
 const fuzzball = require('fuzzball');
 const { log } = require('apify');
+const { normalizePreHeaderRow } = require('./csvParser');
 
 /**
  * Common variations of "target" to match against
@@ -77,16 +78,50 @@ function cleanTargetAddress(address) {
 
 /**
  * Find the target property in the dataset using fuzzy matching
- * @param {Array<Object>} properties - Array of property objects
+ * 
+ * CRITICAL FIX (v2.3): Pre-Header Row Target Detection
+ * - Now searches pre-header rows FIRST before searching normalized data
+ * - Handles cases where target appears before the CSV header row
+ * - Normalizes pre-header rows on-the-fly for target detection
+ * 
+ * @param {Array<Object>} properties - Array of normalized property objects
+ * @param {Array<Array>} preHeaderRows - Raw CSV rows that appear before the header (optional)
  * @returns {Object} Result containing target property and remaining properties
  * @throws {Error} If no target found, multiple targets found, or target missing required fields
  */
-function findTarget(properties) {
+function findTarget(properties, preHeaderRows = []) {
     log.info('Searching for target property...');
+    log.info(`Searching in ${properties.length} normalized properties and ${preHeaderRows.length} pre-header rows`);
     
     const targetCandidates = [];
 
-    // Scan all rows and all columns for target indicators
+    // STEP 1: Search pre-header rows first (these are rows that appear BEFORE the header row)
+    log.info('Step 1: Searching pre-header rows for target...');
+    preHeaderRows.forEach((rawRow, index) => {
+        log.info(`Checking pre-header row ${index}:`, rawRow);
+        
+        // Normalize the raw row to a property object
+        const property = normalizePreHeaderRow(rawRow);
+        
+        let isTarget = false;
+        let targetIndicatorFound = '';
+        
+        // Check if this row has the isTarget flag set
+        if (property.isTarget === 1) {
+            isTarget = true;
+            targetIndicatorFound = 'isTarget flag from pre-header row';
+            log.info(`✓ Target indicator found in pre-header row ${index}: ${targetIndicatorFound}`);
+            targetCandidates.push({ 
+                property, 
+                index: -1 - index, // Negative index to distinguish from properties array
+                indicator: targetIndicatorFound,
+                source: 'pre-header'
+            });
+        }
+    });
+
+    // STEP 2: Scan normalized properties for target indicators
+    log.info('Step 2: Searching normalized properties for target...');
     properties.forEach((property, index) => {
         let isTarget = false;
         let targetIndicatorFound = '';
@@ -126,7 +161,12 @@ function findTarget(properties) {
 
         if (isTarget) {
             log.info(`Target candidate found at row ${index}: ${targetIndicatorFound}`);
-            targetCandidates.push({ property, index, indicator: targetIndicatorFound });
+            targetCandidates.push({ 
+                property, 
+                index, 
+                indicator: targetIndicatorFound,
+                source: 'normalized'
+            });
         }
     });
 
@@ -140,14 +180,15 @@ function findTarget(properties) {
     if (targetCandidates.length > 1) {
         const error = `FATAL ERROR: Multiple target properties found (${targetCandidates.length}). Only one property should be marked as target.`;
         log.error(error);
-        targetCandidates.forEach(({ index, indicator }) => {
-            log.error(`  - Row ${index}: ${indicator}`);
+        targetCandidates.forEach(({ index, indicator, source }) => {
+            log.error(`  - Row ${index} (${source}): ${indicator}`);
         });
         throw new Error(error);
     }
 
     // Extract target property
-    const { property: targetProperty, index: targetIndex } = targetCandidates[0];
+    const { property: targetProperty, index: targetIndex, source: targetSource } = targetCandidates[0];
+    log.info(`Target found from ${targetSource} at index ${targetIndex}`);
     
     // CRITICAL FIX: Target indicator can be in ANY field (Date, Address, etc.)
     // We need to find which field contains the target indicator and extract address data from it
@@ -253,8 +294,16 @@ function findTarget(properties) {
     // Set isTarget flag
     targetProperty.isTarget = 1;
 
-    // Remove target from properties array
-    const remainingProperties = properties.filter((_, index) => index !== targetIndex);
+    // Remove target from properties array (only if it came from normalized properties)
+    let remainingProperties;
+    if (targetSource === 'normalized') {
+        remainingProperties = properties.filter((_, index) => index !== targetIndex);
+        log.info(`Removed target from properties array (was at index ${targetIndex})`);
+    } else {
+        // Target came from pre-header rows, so it's not in properties array
+        remainingProperties = properties;
+        log.info('Target from pre-header rows - properties array unchanged');
+    }
 
     log.info('Target property successfully identified and validated');
     

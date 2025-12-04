@@ -85,8 +85,12 @@ function isURL(str) {
  * - Prevents URLs from being mapped to Date, Postcode, or other non-URL columns
  * - Ensures URLs always go to URL/Link columns
  * 
+ * CRITICAL FIX (v2.3): Pre-Header Row Preservation
+ * - Returns pre-header rows (rows before the detected header) for target detection
+ * - Allows target to be found even if it appears before the header row
+ * 
  * @param {string} csvContent - Raw CSV content
- * @returns {Array<Object>} Array of parsed rows with normalized headers
+ * @returns {Object} Object with normalizedData array and preHeaderRows array
  */
 function parseCSV(csvContent) {
     log.info('Parsing CSV content...');
@@ -111,11 +115,19 @@ function parseCSV(csvContent) {
         log.info('Header mapping detected:', headerMapping);
         log.info(`Header row index: ${headerRowIndex}`);
 
+        // Extract pre-header rows (rows before the header row)
+        const preHeaderRows = records.slice(0, headerRowIndex);
+        log.info(`Extracted ${preHeaderRows.length} pre-header rows for target detection`);
+
         // Convert to objects with standard headers
         const normalizedData = normalizeData(records, headerMapping, headerRowIndex);
         log.info(`Normalized ${normalizedData.length} data rows`);
 
-        return normalizedData;
+        return {
+            normalizedData,
+            preHeaderRows,
+            headerMapping
+        };
     } catch (error) {
         log.error('Failed to parse CSV:', error.message);
         throw error;
@@ -332,6 +344,109 @@ function normalizeData(records, headerMapping, headerRowIndex) {
 }
 
 /**
+ * Normalize a single pre-header row for target detection
+ * Converts a raw CSV row array into a property object
+ * 
+ * @param {Array} row - Raw CSV row array
+ * @returns {Object} Normalized property object with standard headers
+ */
+function normalizePreHeaderRow(row) {
+    const normalizedRow = {};
+    
+    // Initialize all standard headers with empty values
+    STANDARD_HEADERS.forEach(header => {
+        normalizedRow[header] = '';
+    });
+    
+    // Iterate through all cells in the row
+    for (let i = 0; i < row.length; i++) {
+        const cellValue = row[i];
+        if (!cellValue || cellValue === '') continue;
+        
+        const cellStr = String(cellValue).trim();
+        
+        // Check if the cell contains a target indicator
+        const TARGET_PATTERNS = [
+            /target\s+is\s+(.+)/i,
+            /target\s*=\s*(.+)/i,
+            /target\s*:\s*(.+)/i,
+            /target\s+property\s*:?\s*(.+)/i,
+            /tgt\s*:?\s*(.+)/i,
+            /subject\s+property\s*:?\s*(.+)/i,
+            /subject\s*:?\s*(.+)/i
+        ];
+        
+        for (const pattern of TARGET_PATTERNS) {
+            const match = cellStr.match(pattern);
+            if (match && match[1]) {
+                // Extract the address/postcode data after the target indicator
+                const extractedData = match[1].trim();
+                log.info(`Found target indicator in pre-header row cell: "${cellStr}"`);
+                log.info(`Extracted data: "${extractedData}"`);
+                
+                // Try to parse the extracted data as "Address, Postcode" format
+                // UK postcode pattern
+                const postcodeMatch = extractedData.match(/\b([A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2})\b/i);
+                if (postcodeMatch) {
+                    normalizedRow.Postcode = postcodeMatch[1].toUpperCase().replace(/\s+/g, ' ').trim();
+                    // Remove postcode from address
+                    const address = extractedData.replace(postcodeMatch[0], '').replace(/,\s*$/, '').trim();
+                    normalizedRow.Address = address;
+                    log.info(`  Parsed Address: "${address}"`);
+                    log.info(`  Parsed Postcode: "${normalizedRow.Postcode}"`);
+                } else {
+                    // No postcode found, treat entire string as address
+                    normalizedRow.Address = extractedData;
+                    log.info(`  Parsed Address (no postcode): "${extractedData}"`);
+                }
+                
+                // Mark as target
+                normalizedRow.isTarget = 1;
+                
+                return normalizedRow;
+            }
+        }
+        
+        // Check if this is a standalone "target" marker (value is just "target" or "1")
+        if (cellStr.toLowerCase() === 'target' || cellStr === '1') {
+            normalizedRow.isTarget = 1;
+        }
+    }
+    
+    // If no specific target pattern found, just populate whatever data we can
+    // This handles rows like: ["", "7 Fernbank Close", "DN9 3PT", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "1", "", ""]
+    for (let i = 0; i < row.length; i++) {
+        const cellValue = row[i];
+        if (!cellValue || cellValue === '') continue;
+        
+        const cellStr = String(cellValue).trim();
+        
+        // Try to detect what type of data this is
+        // Postcode pattern
+        if (/^[A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2}$/i.test(cellStr)) {
+            normalizedRow.Postcode = cellStr.toUpperCase();
+        }
+        // URL pattern
+        else if (/^https?:\/\//i.test(cellStr)) {
+            normalizedRow.URL = cellStr;
+            normalizedRow.Link = `=HYPERLINK("${cellStr}", "View")`;
+        }
+        // Check for "1" in what might be the isTarget column
+        else if (cellStr === '1' && i > 15) { // isTarget is typically column 21+
+            normalizedRow.isTarget = 1;
+        }
+        // If it looks like an address (contains comma or multiple words)
+        else if (cellStr.includes(',') || cellStr.split(' ').length > 2) {
+            if (normalizedRow.Address === '') {
+                normalizedRow.Address = cellStr;
+            }
+        }
+    }
+    
+    return normalizedRow;
+}
+
+/**
  * Clean and normalize a single property object
  * 
  * CRITICAL FIX (v2.1): Postcode Extraction from Combined Address Fields
@@ -405,5 +520,6 @@ function cleanProperty(property) {
 module.exports = {
     parseCSV,
     cleanProperty,
+    normalizePreHeaderRow,
     STANDARD_HEADERS
 };
