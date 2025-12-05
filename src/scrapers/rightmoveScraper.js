@@ -223,6 +223,9 @@ async function scrapeRightmoveListing(url) {
 
         // Add URL to data
         data.URL = url;
+        
+        // BATCH 3: Store Rightmove URL in dedicated column for Excel hyperlinks
+        data.URL_Rightmove = url;
 
         // Validation - mark for review if critical fields missing
         if (!data.Address || !data.Price) {
