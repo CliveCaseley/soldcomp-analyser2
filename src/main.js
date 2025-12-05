@@ -97,9 +97,13 @@ Actor.main(async () => {
             log.warning('Skipping geocoding and distance calculation (no GOOGLE_API_KEY)');
         }
         
-        // Step 11: Enrich with EPC data
+        // Step 11: Enrich with EPC data (including target)
         log.info('=== STEP 10: Enriching with EPC data ===');
         await enrichWithEPCData(allProperties, EPC_API_KEY);
+        
+        // ENHANCEMENT A: Fetch EPC certificate for target property
+        log.info('=== STEP 10.1: Enriching target property with EPC data ===');
+        await enrichWithEPCData([target], EPC_API_KEY);
         
         // Step 11.5: Final data processing - ensure Sqm calculated for ALL properties
         log.info('=== STEP 10.5: Final data processing (Sqm calculation) ===');
@@ -200,23 +204,41 @@ function mergeScrapedData(existing, scraped) {
  * - Now maps geocoded coordinates to output columns (Latitude, Longitude)
  * - Previously stored in _geocode internal field only
  * 
+ * ENHANCEMENT C: Geocode missing lat/long and calculate all distances
+ * - Skip geocoding if lat/long already exists
+ * - Always calculate distance if coordinates are available
+ * - Fill missing coordinates for any property
+ * 
  * @param {Array<Object>} properties - Properties to geocode
  * @param {Object} target - Target property
  * @param {string} apiKey - Google API key
  */
 async function geocodeAndCalculateDistances(properties, target, apiKey) {
-    // Geocode target property first
+    // Geocode target property first (or use existing coordinates)
     log.info('Geocoding target property...');
-    const targetGeocode = await geocodeAddress(target.Address, target.Postcode, apiKey);
+    let targetGeocode;
     
-    if (!targetGeocode) {
-        log.warning('Failed to geocode target property - distances cannot be calculated');
-        return;
+    if (target.Latitude && target.Longitude) {
+        log.info('Target already has coordinates, using existing values');
+        targetGeocode = {
+            lat: parseFloat(target.Latitude),
+            lng: parseFloat(target.Longitude)
+        };
+        target._geocode = targetGeocode;
+    } else {
+        targetGeocode = await geocodeAddress(target.Address, target.Postcode, apiKey);
+        
+        if (!targetGeocode) {
+            log.warning('Failed to geocode target property - distances cannot be calculated');
+            return;
+        }
+        
+        target._geocode = targetGeocode;
+        target.Latitude = targetGeocode.lat;
+        target.Longitude = targetGeocode.lng;
     }
     
-    target._geocode = targetGeocode;
-    target.Latitude = targetGeocode.lat;
-    target.Longitude = targetGeocode.lng;
+    // Add/update target streetview URL
     const targetStreetviewURL = generateStreetviewURL(targetGeocode.lat, targetGeocode.lng);
     target['Google Streetview URL'] = targetStreetviewURL;
     target['Google Streetview Link'] = `=HYPERLINK("${targetStreetviewURL}", "View Map")`;
@@ -229,32 +251,48 @@ async function geocodeAndCalculateDistances(properties, target, apiKey) {
             continue;
         }
         
-        const geocode = await geocodeAddress(property.Address, property.Postcode, apiKey);
+        let geocode;
         
-        if (geocode) {
+        // ENHANCEMENT C: Check if property already has coordinates
+        if (property.Latitude && property.Longitude) {
+            log.info(`Property already has coordinates: ${property.Address}`);
+            geocode = {
+                lat: parseFloat(property.Latitude),
+                lng: parseFloat(property.Longitude)
+            };
             property._geocode = geocode;
-            property.Latitude = geocode.lat;
-            property.Longitude = geocode.lng;
-            const streetviewURL = generateStreetviewURL(geocode.lat, geocode.lng);
-            property['Google Streetview URL'] = streetviewURL;
-            property['Google Streetview Link'] = `=HYPERLINK("${streetviewURL}", "View Map")`;
-            
-            // Calculate distance from target
-            const distance = calculateDistance(
-                targetGeocode.lat,
-                targetGeocode.lng,
-                geocode.lat,
-                geocode.lng
-            );
-            
-            property._distanceValue = distance; // Store numeric value for ranking
-            property.Distance = formatDistance(distance);
-            
-            log.info(`  ${property.Address}: ${property.Distance} (${geocode.lat}, ${geocode.lng})`);
         } else {
-            log.warning(`Failed to geocode: ${property.Address}, ${property.Postcode}`);
-            property.needs_review = 1;
+            // Geocode if coordinates are missing
+            geocode = await geocodeAddress(property.Address, property.Postcode, apiKey);
+            
+            if (geocode) {
+                property._geocode = geocode;
+                property.Latitude = geocode.lat;
+                property.Longitude = geocode.lng;
+            } else {
+                log.warning(`Failed to geocode: ${property.Address}, ${property.Postcode}`);
+                property.needs_review = 1;
+                continue;
+            }
         }
+        
+        // Add/update streetview URL
+        const streetviewURL = generateStreetviewURL(geocode.lat, geocode.lng);
+        property['Google Streetview URL'] = streetviewURL;
+        property['Google Streetview Link'] = `=HYPERLINK("${streetviewURL}", "View Map")`;
+        
+        // ENHANCEMENT C: Always calculate distance if coordinates are available
+        const distance = calculateDistance(
+            targetGeocode.lat,
+            targetGeocode.lng,
+            geocode.lat,
+            geocode.lng
+        );
+        
+        property._distanceValue = distance; // Store numeric value for ranking
+        property.Distance = formatDistance(distance);
+        
+        log.info(`  ${property.Address}: ${property.Distance} (${geocode.lat}, ${geocode.lng})`);
     }
 }
 
@@ -266,10 +304,16 @@ async function geocodeAndCalculateDistances(properties, target, apiKey) {
  * - Populates both 'EPC rating' and 'EPC Certificate' columns
  * - Certificate column contains individual property certificate URLs
  * 
+ * ENHANCEMENT D: Scrape floor area from EPC certificates
+ * - Automatically scrapes floor area from certificate pages
+ * - Falls back to direct certificate scraping if initial attempt failed
+ * 
  * @param {Array<Object>} properties - Properties to enrich
  * @param {string} apiKey - EPC API key
  */
 async function enrichWithEPCData(properties, apiKey) {
+    const { scrapeFloorAreaFromCertificate } = require('./utils/epcHandler');
+    
     for (const property of properties) {
         if (!property.Postcode) continue;
         
@@ -288,13 +332,25 @@ async function enrichWithEPCData(properties, apiKey) {
                     log.info(`  EPC Certificate URL: ${epcData.certificateURL}`);
                 }
                 
-                // Use floor area from EPC if property doesn't have it
+                // ENHANCEMENT D: Use floor area from EPC if property doesn't have it
                 if (epcData.floorArea && !property['Sq. ft']) {
                     // EPC floor area is in sq meters, convert to sq ft
                     const sqFt = Math.round(epcData.floorArea / 0.092903);
                     property['Sq. ft'] = sqFt;
                     property.Sqm = epcData.floorArea;
                     log.info(`  Using EPC floor area: ${sqFt} sq ft (${epcData.floorArea} sqm)`);
+                }
+                
+                // ENHANCEMENT D: Fallback - if we have certificate URL but no floor area, try scraping directly
+                if (!property['Sq. ft'] && epcData.certificateURL && !epcData.floorArea) {
+                    log.info(`  Attempting direct floor area scrape from certificate...`);
+                    const scrapedFloorArea = await scrapeFloorAreaFromCertificate(epcData.certificateURL);
+                    if (scrapedFloorArea) {
+                        const sqFt = Math.round(scrapedFloorArea / 0.092903);
+                        property['Sq. ft'] = sqFt;
+                        property.Sqm = scrapedFloorArea;
+                        log.info(`  Using scraped floor area: ${sqFt} sq ft (${scrapedFloorArea} sqm)`);
+                    }
                 }
             }
         } catch (error) {
