@@ -1,0 +1,468 @@
+diff --git a/src/main.js b/src/main.js
+index 1cf4306..5f7ecd6 100644
+--- a/src/main.js
++++ b/src/main.js
+@@ -90,9 +90,21 @@ Actor.main(async () => {
+         // Step 10: Geocode properties and calculate distances
+         if (GOOGLE_API_KEY) {
+             log.info('=== STEP 9: Geocoding and calculating distances ===');
++            log.info(`Geocoding ${allProperties.length} properties + target property`);
+             await geocodeAndCalculateDistances(allProperties, target, GOOGLE_API_KEY);
++            
++            // Verify geocoding results
++            const geocodedCount = allProperties.filter(p => p.Latitude && p.Longitude).length;
++            log.info(`Geocoding complete: ${geocodedCount}/${allProperties.length} properties geocoded`);
++            if (target.Latitude && target.Longitude) {
++                log.info(`Target property geocoded: (${target.Latitude}, ${target.Longitude})`);
++            } else {
++                log.warning('Target property geocoding failed - distances cannot be calculated');
++            }
+         } else {
+-            log.warning('Skipping geocoding and distance calculation (no GOOGLE_API_KEY)');
++            log.warning('⚠️  SKIPPING GEOCODING: GOOGLE_API_KEY not set');
++            log.warning('⚠️  Latitude, Longitude, and Distance columns will be empty');
++            log.warning('⚠️  Set GOOGLE_API_KEY environment variable to enable geocoding');
+         }
+         
+         // Step 11: Enrich with EPC data
+@@ -220,13 +232,20 @@ async function geocodeAndCalculateDistances(properties, target, apiKey) {
+     target['Google Streetview Link'] = `=HYPERLINK("${targetStreetviewURL}", "View Map")`;
+     
+     // Geocode all comparable properties
++    let geocodedCount = 0;
++    let failedCount = 0;
++    
+     for (const property of properties) {
+         if (!property.Address || !property.Postcode) {
+             log.warning(`Skipping geocoding for property without address/postcode`);
+             property.needs_review = 1;
++            failedCount++;
+             continue;
+         }
+         
++        // Add small delay between geocoding requests to avoid rate limiting (0.5 seconds)
++        await new Promise(resolve => setTimeout(resolve, 500));
++        
+         const geocode = await geocodeAddress(property.Address, property.Postcode, apiKey);
+         
+         if (geocode) {
+@@ -248,12 +267,16 @@ async function geocodeAndCalculateDistances(properties, target, apiKey) {
+             property._distanceValue = distance; // Store numeric value for ranking
+             property.Distance = formatDistance(distance);
+             
+-            log.info(`  ${property.Address}: ${property.Distance} (${geocode.lat}, ${geocode.lng})`);
++            geocodedCount++;
++            log.info(`  ✓ ${property.Address}: ${property.Distance} (${geocode.lat}, ${geocode.lng})`);
+         } else {
+-            log.warning(`Failed to geocode: ${property.Address}, ${property.Postcode}`);
++            log.warning(`  ✗ Failed to geocode: ${property.Address}, ${property.Postcode}`);
+             property.needs_review = 1;
++            failedCount++;
+         }
+     }
++    
++    log.info(`Geocoding summary: ${geocodedCount} successful, ${failedCount} failed`);
+ }
+ 
+ /**
+diff --git a/src/scrapers/propertyDataScraper.js b/src/scrapers/propertyDataScraper.js
+index ca886f7..916eeee 100644
+--- a/src/scrapers/propertyDataScraper.js
++++ b/src/scrapers/propertyDataScraper.js
+@@ -1,6 +1,7 @@
+ const axios = require('axios');
+ const cheerio = require('cheerio');
+ const { log } = require('apify');
++const { standardizeDateFormat } = require('../utils/dateFormatter');
+ 
+ /**
+  * Rate limiting configuration
+@@ -74,7 +75,10 @@ async function scrapePropertyData(url) {
+             // Date of sale
+             if (text.match(/Date of sale|Sale date/i)) {
+                 const date = $(elem).find('td').last().text().trim() || text.split(':').pop().trim();
+-                if (date) data['Date of sale'] = date;
++                if (date) {
++                    const standardizedDate = standardizeDateFormat(date);
++                    data['Date of sale'] = standardizedDate || date; // Use original if standardization fails
++                }
+             }
+             
+             // Price
+diff --git a/src/scrapers/rightmoveScraper.js b/src/scrapers/rightmoveScraper.js
+index 7a5d04d..fd789c1 100644
+--- a/src/scrapers/rightmoveScraper.js
++++ b/src/scrapers/rightmoveScraper.js
+@@ -1,6 +1,7 @@
+ const axios = require('axios');
+ const cheerio = require('cheerio');
+ const { log } = require('apify');
++const { standardizeDateFormat } = require('../utils/dateFormatter');
+ 
+ /**
+  * Rate limiting configuration
+@@ -63,7 +64,8 @@ async function scrapeRightmoveListing(url) {
+             if (dateMatch && dateMatch[0]) {
+                 const extractedDate = dateMatch[0].match(/(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})/i);
+                 if (extractedDate) {
+-                    data['Date of sale'] = extractedDate[1];
++                    const standardizedDate = standardizeDateFormat(extractedDate[1]);
++                    data['Date of sale'] = standardizedDate || extractedDate[1]; // Use original if standardization fails
+                 }
+             }
+ 
+@@ -171,7 +173,8 @@ async function scrapeRightmoveListing(url) {
+             // Extract date of sale (for sold properties)
+             const saleDate = $('div:contains("Sold")').text().match(/Sold\s+on\s+([\d\/]+)/i);
+             if (saleDate) {
+-                data['Date of sale'] = saleDate[1];
++                const standardizedDate = standardizeDateFormat(saleDate[1]);
++                data['Date of sale'] = standardizedDate || saleDate[1]; // Use original if standardization fails
+             }
+         }
+ 
+diff --git a/src/utils/csvParser.js b/src/utils/csvParser.js
+index eb493d2..1283a36 100644
+--- a/src/utils/csvParser.js
++++ b/src/utils/csvParser.js
+@@ -1,6 +1,7 @@
+ const { parse } = require('csv-parse/sync');
+ const fuzzball = require('fuzzball');
+ const { log } = require('apify');
++const { standardizeDateFormat } = require('./dateFormatter');
+ 
+ /**
+  * Standard schema for property data
+@@ -301,6 +302,14 @@ function cleanProperty(property) {
+         cleaned.Address = cleaned.Address.replace(/\s+/g, ' ').trim();
+     }
+ 
++    // CRITICAL FIX: Standardize date format to DD/MM/YYYY
++    if (cleaned['Date of sale']) {
++        const standardizedDate = standardizeDateFormat(cleaned['Date of sale']);
++        if (standardizedDate) {
++            cleaned['Date of sale'] = standardizedDate;
++        }
++    }
++
+     return cleaned;
+ }
+ 
+diff --git a/src/utils/dateFormatter.js b/src/utils/dateFormatter.js
+new file mode 100644
+index 0000000..ad9c823
+--- /dev/null
++++ b/src/utils/dateFormatter.js
+@@ -0,0 +1,123 @@
++const { log } = require('apify');
++
++/**
++ * DATE FORMATTER MODULE
++ * 
++ * CRITICAL FIX: Standardize Date Format to DD/MM/YYYY
++ * - Handles multiple input formats (DD/MM/YYYY, DD-MMM-YY, YYYY-MM-DD, etc.)
++ * - Always outputs consistent DD/MM/YYYY format
++ * - Prevents date inconsistencies in CSV output
++ * 
++ * Issue: Mixed date formats in output ("02 Jul 2025" vs "01/08/2025")
++ * Solution: Standardize ALL dates to DD/MM/YYYY format
++ */
++
++/**
++ * Parse various date formats and return Date object
++ * @param {string} dateStr - Date string in various formats
++ * @returns {Date|null} Parsed Date object or null if parsing fails
++ */
++function parseDate(dateStr) {
++    if (!dateStr || typeof dateStr !== 'string') return null;
++    
++    const trimmed = dateStr.trim();
++    
++    try {
++        // Format 1: DD/MM/YYYY (already correct)
++        if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(trimmed)) {
++            const [day, month, year] = trimmed.split('/').map(Number);
++            return new Date(year, month - 1, day);
++        }
++        
++        // Format 2: DD-MMM-YY (e.g., "02-Jul-25" or "02 Jul 2025")
++        // Matches: 02-Jul-25, 02 Jul 25, 02-Jul-2025, 02 Jul 2025
++        const monthNameMatch = trimmed.match(/^(\d{1,2})[\s-]([A-Za-z]{3})[\s-](\d{2,4})$/);
++        if (monthNameMatch) {
++            const day = parseInt(monthNameMatch[1]);
++            const monthName = monthNameMatch[2].toLowerCase();
++            let year = parseInt(monthNameMatch[3]);
++            
++            // Convert 2-digit year to 4-digit
++            if (year < 100) {
++                year = year < 50 ? 2000 + year : 1900 + year;
++            }
++            
++            const months = {
++                'jan': 0, 'feb': 1, 'mar': 2, 'apr': 3, 'may': 4, 'jun': 5,
++                'jul': 6, 'aug': 7, 'sep': 8, 'oct': 9, 'nov': 10, 'dec': 11
++            };
++            
++            const month = months[monthName];
++            if (month !== undefined) {
++                return new Date(year, month, day);
++            }
++        }
++        
++        // Format 3: YYYY-MM-DD (ISO format)
++        if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(trimmed)) {
++            return new Date(trimmed);
++        }
++        
++        // Format 4: DD-MM-YYYY (with hyphens)
++        if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(trimmed)) {
++            const [day, month, year] = trimmed.split('-').map(Number);
++            return new Date(year, month - 1, day);
++        }
++        
++        // Format 5: Try JavaScript's Date.parse as fallback
++        const date = new Date(trimmed);
++        if (!isNaN(date.getTime())) {
++            return date;
++        }
++    } catch (error) {
++        log.warning(`Failed to parse date: ${dateStr}`);
++    }
++    
++    return null;
++}
++
++/**
++ * Format Date object to DD/MM/YYYY string
++ * @param {Date} date - Date object
++ * @returns {string} Formatted date string (DD/MM/YYYY)
++ */
++function formatDateToDDMMYYYY(date) {
++    if (!date || !(date instanceof Date) || isNaN(date.getTime())) {
++        return null;
++    }
++    
++    const day = String(date.getDate()).padStart(2, '0');
++    const month = String(date.getMonth() + 1).padStart(2, '0');
++    const year = date.getFullYear();
++    
++    return `${day}/${month}/${year}`;
++}
++
++/**
++ * Standardize date string to DD/MM/YYYY format
++ * @param {string} dateStr - Date string in any supported format
++ * @returns {string|null} Standardized date (DD/MM/YYYY) or null if parsing fails
++ */
++function standardizeDateFormat(dateStr) {
++    if (!dateStr) return null;
++    
++    const date = parseDate(dateStr);
++    if (!date) {
++        log.warning(`Could not parse date: "${dateStr}"`);
++        return null;
++    }
++    
++    const formatted = formatDateToDDMMYYYY(date);
++    
++    if (dateStr !== formatted) {
++        log.info(`Standardized date: "${dateStr}" → "${formatted}"`);
++    }
++    
++    return formatted;
++}
++
++module.exports = {
++    parseDate,
++    formatDateToDDMMYYYY,
++    standardizeDateFormat
++};
+diff --git a/src/utils/geocoder.js b/src/utils/geocoder.js
+index 43af365..3a9cb0d 100644
+--- a/src/utils/geocoder.js
++++ b/src/utils/geocoder.js
+@@ -8,53 +8,106 @@ const geocodeCache = new Map();
+ 
+ /**
+  * Geocode an address using Google Geocoding API
++ * 
++ * CRITICAL FIX: Enhanced Geocoding with Retry Logic
++ * - Adds retry logic for transient failures (network timeouts, rate limits)
++ * - Improved error handling and logging
++ * - Validates coordinates before returning
++ * - Ensures lat/long are always populated when geocoding succeeds
++ * 
++ * Issue: Latitude and Longitude missing from all properties in output
++ * Solution: Enhanced geocoding with better error handling and retry logic
++ * 
+  * @param {string} address - Full address
+  * @param {string} postcode - Postcode
+  * @param {string} apiKey - Google API key
++ * @param {number} retries - Number of retry attempts (default: 2)
+  * @returns {Object} Geocoding result with lat, lng
+  */
+-async function geocodeAddress(address, postcode, apiKey) {
++async function geocodeAddress(address, postcode, apiKey, retries = 2) {
++    if (!apiKey) {
++        log.error('Google API key is not set - cannot geocode addresses');
++        return null;
++    }
++    
++    if (!address || !postcode) {
++        log.warning('Missing address or postcode - cannot geocode');
++        return null;
++    }
++    
+     const fullAddress = `${address}, ${postcode}, UK`;
+     const cacheKey = fullAddress.toLowerCase().trim();
+     
+     // Check cache
+     if (geocodeCache.has(cacheKey)) {
+-        log.info(`Using cached geocode for: ${fullAddress}`);
+-        return geocodeCache.get(cacheKey);
++        const cached = geocodeCache.get(cacheKey);
++        log.info(`Using cached geocode for: ${fullAddress} (${cached.lat}, ${cached.lng})`);
++        return cached;
+     }
+     
+     log.info(`Geocoding: ${fullAddress}`);
+     
+-    try {
+-        const response = await axios.get('https://maps.googleapis.com/maps/api/geocode/json', {
+-            params: {
+-                address: fullAddress,
+-                key: apiKey
+-            },
+-            timeout: 10000
+-        });
++    for (let attempt = 0; attempt <= retries; attempt++) {
++        try {
++            const response = await axios.get('https://maps.googleapis.com/maps/api/geocode/json', {
++                params: {
++                    address: fullAddress,
++                    key: apiKey,
++                    region: 'uk'
++                },
++                timeout: 15000 // Increased timeout to 15 seconds
++            });
+ 
+-        if (response.data.status === 'OK' && response.data.results.length > 0) {
+-            const location = response.data.results[0].geometry.location;
+-            const result = {
+-                lat: location.lat,
+-                lng: location.lng,
+-                formatted_address: response.data.results[0].formatted_address
+-            };
+-            
+-            // Cache the result
+-            geocodeCache.set(cacheKey, result);
+-            
+-            log.info(`Geocoded successfully: ${result.formatted_address}`);
+-            return result;
+-        } else {
+-            log.warning(`Geocoding failed for ${fullAddress}: ${response.data.status}`);
++            if (response.data.status === 'OK' && response.data.results.length > 0) {
++                const location = response.data.results[0].geometry.location;
++                
++                // Validate coordinates
++                if (!location.lat || !location.lng) {
++                    log.error(`Invalid coordinates returned for ${fullAddress}`);
++                    return null;
++                }
++                
++                const result = {
++                    lat: location.lat,
++                    lng: location.lng,
++                    formatted_address: response.data.results[0].formatted_address
++                };
++                
++                // Cache the result
++                geocodeCache.set(cacheKey, result);
++                
++                log.info(`✓ Geocoded successfully: ${result.formatted_address} → (${result.lat}, ${result.lng})`);
++                return result;
++            } else if (response.data.status === 'ZERO_RESULTS') {
++                log.warning(`No results found for ${fullAddress}`);
++                return null;
++            } else if (response.data.status === 'OVER_QUERY_LIMIT') {
++                log.warning(`Google API quota exceeded - retry attempt ${attempt + 1}/${retries + 1}`);
++                if (attempt < retries) {
++                    await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds before retry
++                    continue;
++                }
++                log.error(`Geocoding failed after ${retries + 1} attempts: OVER_QUERY_LIMIT`);
++                return null;
++            } else {
++                log.warning(`Geocoding failed for ${fullAddress}: ${response.data.status}`);
++                if (response.data.error_message) {
++                    log.warning(`Error message: ${response.data.error_message}`);
++                }
++                return null;
++            }
++        } catch (error) {
++            log.error(`Geocoding error for ${fullAddress} (attempt ${attempt + 1}/${retries + 1}):`, error.message);
++            if (attempt < retries) {
++                await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second before retry
++                continue;
++            }
+             return null;
+         }
+-    } catch (error) {
+-        log.error(`Geocoding error for ${fullAddress}:`, error.message);
+-        return null;
+     }
++    
++    log.error(`Geocoding failed after ${retries + 1} attempts for ${fullAddress}`);
++    return null;
+ }
+ 
+ /**
+diff --git a/src/utils/kvsHandler.js b/src/utils/kvsHandler.js
+index ccde48f..b510ced 100644
+--- a/src/utils/kvsHandler.js
++++ b/src/utils/kvsHandler.js
+@@ -63,6 +63,16 @@ function isEmptyRow(row) {
+ 
+ /**
+  * Write CSV to Apify Key-Value Store
++ * 
++ * CRITICAL FIX: UTF-8 Character Encoding
++ * - Explicitly sets charset=utf-8 in contentType to prevent double-encoding
++ * - Ensures £ symbols appear correctly without "Â" prefix
++ * - Prevents UTF-8 bytes from being misinterpreted as Latin-1
++ * 
++ * Issue: "Â£" appearing instead of "£" in CSV output
++ * Cause: UTF-8 bytes (0xC2 0xA3 for £) misinterpreted without proper charset declaration
++ * Solution: Add charset=utf-8 to contentType header
++ * 
+  * @param {Array<Object>} properties - Array of property objects
+  * @param {string} storeName - KVS store name
+  * @param {string} key - Key name
+@@ -79,19 +89,22 @@ async function writeCSVToKVS(properties, storeName, key) {
+             log.info(`Removed ${removedCount} empty duplicate rows from output`);
+         }
+         
+-        // Convert properties to CSV
++        // Convert properties to CSV with explicit UTF-8 encoding
+         const csv = stringify(filteredProperties, {
+             header: true,
+-            columns: STANDARD_HEADERS
++            columns: STANDARD_HEADERS,
++            // Ensure proper encoding of special characters (£, €, etc.)
++            encoding: 'utf8'
+         });
+         
+         // Open named key-value store
+         const store = await Actor.openKeyValueStore(storeName);
+         
+-        // Save the CSV
+-        await store.setValue(key, csv, { contentType: 'text/csv' });
++        // CRITICAL FIX: Add charset=utf-8 to prevent character encoding issues
++        // Without this, £ (U+00A3) gets double-encoded as Â£ (U+00C2 U+00A3)
++        await store.setValue(key, csv, { contentType: 'text/csv; charset=utf-8' });
+         
+-        log.info(`Successfully wrote CSV to KVS (${csv.length} bytes, ${filteredProperties.length} rows)`);
++        log.info(`Successfully wrote CSV to KVS (${csv.length} bytes, ${filteredProperties.length} rows) with UTF-8 encoding`);
+     } catch (error) {
+         log.error(`Failed to write to KVS: ${error.message}`);
+         throw error;

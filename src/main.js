@@ -332,24 +332,50 @@ async function enrichWithEPCData(properties, apiKey) {
                     log.info(`  EPC Certificate URL: ${epcData.certificateURL}`);
                 }
                 
-                // ENHANCEMENT D: Use floor area from EPC if property doesn't have it
-                if (epcData.floorArea && !property['Sq. ft']) {
-                    // EPC floor area is in sq meters, convert to sq ft
-                    const sqFt = Math.round(epcData.floorArea / 0.092903);
-                    property['Sq. ft'] = sqFt;
-                    property.Sqm = epcData.floorArea;
-                    log.info(`  Using EPC floor area: ${sqFt} sq ft (${epcData.floorArea} sqm)`);
+                // BATCH 1 ENHANCEMENT: Use EPC floor area as arbiter for conflicts
+                let epcFloorAreaSqm = epcData.floorArea;
+                
+                // Try direct scraping if floor area not in initial data
+                if (!epcFloorAreaSqm && epcData.certificateURL) {
+                    log.info(`  Attempting direct floor area scrape from certificate...`);
+                    epcFloorAreaSqm = await scrapeFloorAreaFromCertificate(epcData.certificateURL);
                 }
                 
-                // ENHANCEMENT D: Fallback - if we have certificate URL but no floor area, try scraping directly
-                if (!property['Sq. ft'] && epcData.certificateURL && !epcData.floorArea) {
-                    log.info(`  Attempting direct floor area scrape from certificate...`);
-                    const scrapedFloorArea = await scrapeFloorAreaFromCertificate(epcData.certificateURL);
-                    if (scrapedFloorArea) {
-                        const sqFt = Math.round(scrapedFloorArea / 0.092903);
-                        property['Sq. ft'] = sqFt;
-                        property.Sqm = scrapedFloorArea;
-                        log.info(`  Using scraped floor area: ${sqFt} sq ft (${scrapedFloorArea} sqm)`);
+                if (epcFloorAreaSqm) {
+                    const epcSqFt = Math.round(epcFloorAreaSqm / 0.092903);
+                    
+                    // Check if this property has a floor area conflict from duplicate merging
+                    if (property._floorAreaConflict) {
+                        log.info(`  ✓ Resolving floor area conflict with EPC data...`);
+                        log.info(`    Conflicting values: ${property._floorAreaConflict.value1} vs ${property._floorAreaConflict.value2}`);
+                        log.info(`    EPC arbiter value: ${epcSqFt} sq ft (${epcFloorAreaSqm} sqm)`);
+                        
+                        // Use EPC floor area as the authoritative source
+                        property['Sq. ft'] = epcSqFt;
+                        property.Sqm = epcFloorAreaSqm;
+                        
+                        // Update needs_review flag to indicate resolution
+                        if (property.needs_review) {
+                            property.needs_review = property.needs_review.replace(
+                                /Sq\. ft conflict: [^;]+/g,
+                                `Floor area resolved by EPC: ${epcSqFt} sqft`
+                            );
+                            property.needs_review = property.needs_review.replace(
+                                /Sqm conflict: [^;]+/g,
+                                `Floor area resolved by EPC: ${epcFloorAreaSqm} sqm`
+                            );
+                        }
+                        
+                        // Clean up conflict marker
+                        delete property._floorAreaConflict;
+                        
+                        log.info(`  ✓ Conflict resolved using EPC floor area`);
+                    }
+                    // Otherwise, use EPC floor area if property doesn't have it
+                    else if (!property['Sq. ft']) {
+                        property['Sq. ft'] = epcSqFt;
+                        property.Sqm = epcFloorAreaSqm;
+                        log.info(`  Using EPC floor area: ${epcSqFt} sq ft (${epcFloorAreaSqm} sqm)`);
                     }
                 }
             }

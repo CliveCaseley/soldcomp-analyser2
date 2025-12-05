@@ -120,6 +120,8 @@ function normalizeURL(url) {
 /**
  * Normalize address string for consistent duplicate detection
  * Removes city names, postcodes, and normalizes formatting
+ * ENHANCED VERSION (Batch 1): Better comma handling for duplicate detection
+ * 
  * @param {string} address - Raw address string
  * @param {string} postcode - Postcode (to remove from address if present)
  * @returns {string} Normalized address
@@ -148,6 +150,7 @@ function normalizeAddress(address, postcode) {
     normalized = normalized.replace(/\b[a-z]{1,2}\d{1,2}[a-z]?\s?\d[a-z]{2}\b/gi, '');
     
     // Remove common UK city names that appear in this dataset
+    // Extended list to include more common towns/cities
     const cityNames = [
         'scunthorpe',
         'lincolnshire', 
@@ -155,7 +158,14 @@ function normalizeAddress(address, postcode) {
         'lincs',
         'england',
         'uk',
-        'united kingdom'
+        'united kingdom',
+        'blaxton',
+        'doncaster',
+        'hull',
+        'grimsby',
+        'leeds',
+        'sheffield',
+        'york'
     ];
     
     cityNames.forEach(city => {
@@ -163,6 +173,10 @@ function normalizeAddress(address, postcode) {
         normalized = normalized.replace(new RegExp(`,\\s*${city}\\s*$`, 'gi'), '');
         normalized = normalized.replace(new RegExp(`\\s+${city}\\s*$`, 'gi'), '');
     });
+    
+    // ENHANCEMENT: Better comma normalization for duplicate matching
+    // Remove commas after house numbers (e.g., "32," → "32")
+    normalized = normalized.replace(/^(\d+[a-z]?),\s*/i, '$1 ');
     
     // Normalize comma usage
     // Remove leading/trailing commas
@@ -253,8 +267,50 @@ function calculateCompleteness(property) {
 }
 
 /**
+ * Check if a URL is a Rightmove URL
+ * @param {string} url - URL to check
+ * @returns {boolean} True if Rightmove URL
+ */
+function isRightmoveURL(url) {
+    return url && url.toLowerCase().includes('rightmove.co.uk');
+}
+
+/**
+ * Check if a URL is a PropertyData URL
+ * @param {string} url - URL to check
+ * @returns {boolean} True if PropertyData URL
+ */
+function isPropertyDataURL(url) {
+    return url && url.toLowerCase().includes('propertydata.co.uk');
+}
+
+/**
+ * Detect significant conflicts in floor area data
+ * Returns true if there's a significant difference (>10%) between values
+ * @param {number} value1 - First floor area value
+ * @param {number} value2 - Second floor area value
+ * @returns {boolean} True if significant conflict exists
+ */
+function hasFloorAreaConflict(value1, value2) {
+    if (!value1 || !value2) return false;
+    if (value1 === value2) return false;
+    
+    const diff = Math.abs(value1 - value2);
+    const avg = (value1 + value2) / 2;
+    const percentDiff = (diff / avg) * 100;
+    
+    return percentDiff > 10; // More than 10% difference
+}
+
+/**
  * Merge two property objects, keeping most complete data
- * Prefers entries with PropertyData URLs and more complete information
+ * ENHANCED VERSION (Batch 1 - Issue 2): Better duplicate merging
+ * 
+ * Improvements:
+ * - Keeps BOTH URLs from different sources (RM + PropertyData)
+ * - Uses EPC floor area as final arbiter for conflicts
+ * - Adds "Needs Review" flag for significant differences
+ * 
  * @param {Object} existing - Existing property
  * @param {Object} newData - New property data
  * @returns {Object} Merged property
@@ -268,10 +324,51 @@ function mergeProperties(existing, newData) {
     let merged = existingScore >= newScore ? { ...existing } : { ...newData };
     let lesserData = existingScore >= newScore ? newData : existing;
     
+    // Track if we need to add "Needs Review" flag
+    let needsReview = false;
+    let reviewReasons = [];
+    
+    // ENHANCEMENT: Keep both URLs from different sources
+    // Store Rightmove and PropertyData URLs separately
+    const existingURL = existing.URL || '';
+    const newDataURL = newData.URL || '';
+    
+    if (existingURL && newDataURL && existingURL !== newDataURL) {
+        const existingIsRM = isRightmoveURL(existingURL);
+        const newDataIsRM = isRightmoveURL(newDataURL);
+        const existingIsPD = isPropertyDataURL(existingURL);
+        const newDataIsPD = isPropertyDataURL(newDataURL);
+        
+        // If we have both RM and PropertyData, keep both
+        if ((existingIsRM && newDataIsPD) || (existingIsPD && newDataIsRM)) {
+            log.info('Detected duplicate with both Rightmove and PropertyData URLs - keeping both');
+            
+            // Store both URLs
+            if (existingIsRM) {
+                merged.URL_Rightmove = existingURL;
+                merged.URL_PropertyData = newDataURL;
+            } else {
+                merged.URL_Rightmove = newDataURL;
+                merged.URL_PropertyData = existingURL;
+            }
+            
+            // Keep the PropertyData URL in main URL field (for primary link)
+            merged.URL = existingIsPD ? existingURL : newDataURL;
+            
+            // Update Link field to point to PropertyData
+            if (merged.URL_PropertyData) {
+                merged.Link = `=HYPERLINK("${merged.URL_PropertyData}", "View")`;
+            }
+        }
+    }
+    
     // Merge each field from the lesser complete version, filling in gaps
     for (const [key, value] of Object.entries(lesserData)) {
         // Skip internal fields
         if (key.startsWith('_')) continue;
+        
+        // Skip URL field if we already handled it above
+        if (key === 'URL' && (merged.URL_Rightmove || merged.URL_PropertyData)) continue;
         
         // If merged value is empty, use value from lesser data
         if (!merged[key] || merged[key] === '' || merged[key] === 'nan' || merged[key] === '-' || merged[key] === 0) {
@@ -281,11 +378,41 @@ function mergeProperties(existing, newData) {
         }
         // For numeric price fields, prefer higher values (more likely to be accurate)
         else if (key === 'Price' && typeof value === 'number' && typeof merged[key] === 'number') {
-            merged[key] = Math.max(merged[key], value);
+            const existingPrice = merged[key];
+            const newPrice = value;
+            if (existingPrice !== newPrice) {
+                merged[key] = Math.max(merged[key], value);
+                const priceDiff = Math.abs(existingPrice - newPrice);
+                if (priceDiff > 10000) { // More than £10k difference
+                    needsReview = true;
+                    reviewReasons.push(`Price conflict: ${existingPrice} vs ${newPrice}`);
+                }
+            }
         }
-        // For numeric area fields, prefer higher values (more complete measurements)
+        // ENHANCEMENT: For floor area fields, check for conflicts and use EPC as arbiter
         else if ((key === 'Sq. ft' || key === 'Sqm') && typeof value === 'number' && typeof merged[key] === 'number') {
-            merged[key] = Math.max(merged[key], value);
+            const existingArea = merged[key];
+            const newArea = value;
+            
+            // Check for significant conflict
+            if (hasFloorAreaConflict(existingArea, newArea)) {
+                needsReview = true;
+                reviewReasons.push(`${key} conflict: ${existingArea} vs ${newArea}`);
+                log.warning(`Floor area conflict detected: ${existingArea} vs ${newArea} - will use EPC as arbiter`);
+                
+                // Mark for EPC verification (will be resolved by EPC scraping later)
+                merged._floorAreaConflict = {
+                    value1: existingArea,
+                    value2: newArea,
+                    field: key
+                };
+                
+                // For now, take the larger value (more conservative)
+                merged[key] = Math.max(existingArea, newArea);
+            } else {
+                // No significant conflict, take larger value
+                merged[key] = Math.max(merged[key], value);
+            }
         }
     }
     
@@ -293,15 +420,9 @@ function mergeProperties(existing, newData) {
     // If one version has Image_URL (PropertyData enriched) and other doesn't, keep the enriched data
     if (existing.Image_URL && existing.Image_URL !== '' && existing.Image_URL !== 'nan') {
         merged.Image_URL = existing.Image_URL;
-        // Also preserve related PropertyData fields
-        if (existing.URL) merged.URL = existing.URL;
-        if (existing.Link) merged.Link = existing.Link;
     }
     if (newData.Image_URL && newData.Image_URL !== '' && newData.Image_URL !== 'nan') {
         merged.Image_URL = newData.Image_URL;
-        // Also preserve related PropertyData fields
-        if (newData.URL) merged.URL = newData.URL;
-        if (newData.Link) merged.Link = newData.Link;
     }
     
     // Special handling for isTarget flag - always preserve it
@@ -309,14 +430,23 @@ function mergeProperties(existing, newData) {
         merged.isTarget = 1;
     }
     
-    // Reset needs_review if we got better data (no scrape errors and has key fields)
-    if ((existing.needs_review || newData.needs_review) && 
-        !merged._scrapeError && merged.Address && merged.Price) {
-        merged.needs_review = '';
+    // ENHANCEMENT: Set needs_review flag if conflicts detected
+    if (needsReview) {
+        merged.needs_review = reviewReasons.join('; ');
+        log.warning(`Property marked for review: ${merged.Address} - ${merged.needs_review}`);
+    } else {
+        // Reset needs_review if we got better data (no scrape errors and has key fields)
+        if ((existing.needs_review || newData.needs_review) && 
+            !merged._scrapeError && merged.Address && merged.Price) {
+            merged.needs_review = '';
+        }
     }
     
     // Log the merge decision
     log.info(`Merged properties: kept version with score ${Math.max(existingScore, newScore)} (existing: ${existingScore}, new: ${newScore})`);
+    if (merged.URL_Rightmove || merged.URL_PropertyData) {
+        log.info(`  → Kept both URLs: RM=${merged.URL_Rightmove ? 'Yes' : 'No'}, PD=${merged.URL_PropertyData ? 'Yes' : 'No'}`);
+    }
     
     return merged;
 }

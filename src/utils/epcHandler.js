@@ -174,7 +174,105 @@ async function getCertificateNumber(postcode, address, apiKey = null) {
 }
 
 /**
+ * Extract house number from address string
+ * Handles various formats: "32", "32a", "32A", "Flat 1, 32", "32-34", etc.
+ * @param {string} address - Address string
+ * @returns {Object} {primary: string, flat: string|null, hasRange: boolean}
+ */
+function extractHouseNumber(address) {
+    if (!address) return { primary: null, flat: null, hasRange: false };
+    
+    const normalized = address.toLowerCase().trim();
+    
+    // Pattern 1: "Flat X, 32 Street" or "Apartment X, 32 Street"
+    const flatPattern = /(?:flat|apartment|apt|unit)\s*([a-z0-9]+)[,\s]+(\d+[a-z]?)/i;
+    const flatMatch = normalized.match(flatPattern);
+    if (flatMatch) {
+        return {
+            primary: flatMatch[2],
+            flat: flatMatch[1],
+            hasRange: false
+        };
+    }
+    
+    // Pattern 2: "32a Street" or "32A Street" (house number with letter suffix)
+    const letterSuffixPattern = /^(\d+)([a-z])\b/i;
+    const letterMatch = normalized.match(letterSuffixPattern);
+    if (letterMatch) {
+        return {
+            primary: letterMatch[1],
+            flat: letterMatch[2],
+            hasRange: false
+        };
+    }
+    
+    // Pattern 3: "32-34 Street" (range)
+    const rangePattern = /^(\d+)-(\d+)\b/;
+    const rangeMatch = normalized.match(rangePattern);
+    if (rangeMatch) {
+        return {
+            primary: rangeMatch[1],
+            flat: null,
+            hasRange: true,
+            rangeTo: rangeMatch[2]
+        };
+    }
+    
+    // Pattern 4: Simple "32 Street" (just extract leading number)
+    const simplePattern = /^(\d+)\b/;
+    const simpleMatch = normalized.match(simplePattern);
+    if (simpleMatch) {
+        return {
+            primary: simpleMatch[1],
+            flat: null,
+            hasRange: false
+        };
+    }
+    
+    return { primary: null, flat: null, hasRange: false };
+}
+
+/**
+ * Calculate match score between two house number objects
+ * @param {Object} target - Target house number object
+ * @param {Object} candidate - Candidate house number object
+ * @returns {number} Score between 0 and 1
+ */
+function scoreHouseNumberMatch(target, candidate) {
+    if (!target.primary || !candidate.primary) {
+        return 0;
+    }
+    
+    // Exact match on primary number
+    if (target.primary === candidate.primary) {
+        // Check flat/letter suffix match
+        if (target.flat && candidate.flat) {
+            return target.flat === candidate.flat ? 1.0 : 0.7; // Same number, different flat
+        }
+        if (!target.flat && !candidate.flat) {
+            return 1.0; // Perfect match
+        }
+        // One has flat, other doesn't - partial match
+        return 0.8;
+    }
+    
+    // Check if target is in candidate's range
+    if (candidate.hasRange && candidate.rangeTo) {
+        const targetNum = parseInt(target.primary, 10);
+        const rangeStart = parseInt(candidate.primary, 10);
+        const rangeEnd = parseInt(candidate.rangeTo, 10);
+        if (targetNum >= rangeStart && targetNum <= rangeEnd) {
+            return 0.6; // Partial match for range
+        }
+    }
+    
+    return 0; // No match
+}
+
+/**
  * Find best matching address from scraped certificate data
+ * IMPROVED VERSION (Batch 1 - Issue 5): Better house number extraction and matching
+ * 
  * @param {Array} certificates - Array of certificate objects from scraping
  * @param {string} targetAddress - Target address to match
  * @returns {Object} Best matching certificate or null
@@ -184,27 +282,48 @@ function findBestAddressMatchFromScrapedData(certificates, targetAddress) {
         return certificates[0]; // Return first result if no address to match
     }
     
+    log.info(`Matching target address: "${targetAddress}"`);
+    
     const normalizedTarget = targetAddress.toLowerCase().trim();
+    const targetHouseNum = extractHouseNumber(targetAddress);
+    
+    log.info(`Extracted target house number: ${JSON.stringify(targetHouseNum)}`);
+    
     let bestMatch = null;
     let bestScore = 0;
     
     for (const cert of certificates) {
         const certAddress = cert.address.toLowerCase().trim();
+        const certHouseNum = extractHouseNumber(cert.address);
         
-        // Simple scoring: count matching words
-        const targetWords = normalizedTarget.split(/\s+/);
-        const certWords = certAddress.split(/\s+/);
-        const matches = targetWords.filter(word => certWords.includes(word)).length;
-        const score = matches / targetWords.length;
+        // Calculate house number match score (weight: 70%)
+        const houseNumScore = scoreHouseNumberMatch(targetHouseNum, certHouseNum);
         
-        if (score > bestScore) {
-            bestScore = score;
+        // Calculate street name match score (weight: 30%)
+        const targetWords = normalizedTarget.split(/\s+/).filter(w => w.length > 2); // Filter short words
+        const certWords = certAddress.split(/\s+/).filter(w => w.length > 2);
+        const wordMatches = targetWords.filter(word => certWords.includes(word)).length;
+        const streetScore = targetWords.length > 0 ? wordMatches / targetWords.length : 0;
+        
+        // Combined score: prioritize house number matching
+        const totalScore = (houseNumScore * 0.7) + (streetScore * 0.3);
+        
+        log.info(`  Candidate: "${cert.address}" - House#: ${certHouseNum.primary}${certHouseNum.flat || ''}, Score: ${totalScore.toFixed(2)} (house: ${houseNumScore.toFixed(2)}, street: ${streetScore.toFixed(2)})`);
+        
+        if (totalScore > bestScore) {
+            bestScore = totalScore;
             bestMatch = cert;
         }
     }
     
-    // Only return match if score > 50%
-    return bestScore > 0.5 ? bestMatch : certificates[0];
+    // Only return match if score > 40% (lowered threshold due to weighted scoring)
+    if (bestScore > 0.4 && bestMatch) {
+        log.info(`✓ Selected best match: "${bestMatch.address}" (score: ${bestScore.toFixed(2)})`);
+        return bestMatch;
+    } else {
+        log.warning(`✗ No good match found (best score: ${bestScore.toFixed(2)}), returning first result as fallback`);
+        return certificates[0];
+    }
 }
 
 /**
@@ -508,5 +627,7 @@ module.exports = {
     getCertificateNumber,
     scrapeCertificateNumbersFromPostcode,
     findBestAddressMatchFromScrapedData,
-    scrapeFloorAreaFromCertificate
+    scrapeFloorAreaFromCertificate,
+    extractHouseNumber,
+    scoreHouseNumberMatch
 };
