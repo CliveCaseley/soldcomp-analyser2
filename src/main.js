@@ -13,6 +13,7 @@ const { addHyperlinks } = require('./utils/excelHelper');
 const { readCSVFromKVS, writeCSVToKVS } = require('./utils/kvsHandler');
 const { sanitizeProperties } = require('./utils/dataSanitizer');
 const { detectManualEdits } = require('./utils/manualEditDetector');
+const { extractAskingPrice, calculatePricePerSqft, isLiveListing } = require('./utils/askingPriceScraper');
 
 /**
  * Main actor entry point
@@ -113,6 +114,10 @@ Actor.main(async () => {
         // ENHANCEMENT A: Fetch EPC certificate for target property
         log.info('=== STEP 10.1: Enriching target property with EPC data ===');
         await enrichWithEPCData([target], EPC_API_KEY);
+        
+        // BATCH 3: Extract asking price for target property if it has a live listing URL
+        log.info('=== STEP 10.2: Extracting asking price for target property ===');
+        await extractTargetAskingPrice(target);
         
         // Step 11.5: Final data processing - ensure Sqm calculated for ALL properties
         log.info('=== STEP 10.5: Final data processing (Sqm calculation) ===');
@@ -460,6 +465,60 @@ function finalizePropertyData(properties) {
     }
     
     log.info(`Final data processing: Calculated Sqm for ${sqmCalculated} properties`);
+}
+
+/**
+ * BATCH 3: Extract asking price for target property from live listings
+ * 
+ * If the target property has a live listing URL (Rightmove or PropertyData):
+ * 1. Check if URL is a live listing (not sold property)
+ * 2. Scrape asking price from the listing
+ * 3. Update target.Price with asking price
+ * 4. Calculate £/sqft if floor area is available
+ * 
+ * @param {Object} target - Target property
+ */
+async function extractTargetAskingPrice(target) {
+    // Check if target has any listing URLs
+    const urlToCheck = target.URL || target.URL_Rightmove || target.URL_PropertyData;
+    
+    if (!urlToCheck) {
+        log.info('Target property has no listing URL - skipping asking price extraction');
+        return;
+    }
+    
+    // Check if URL is a live listing
+    if (!isLiveListing(urlToCheck)) {
+        log.info(`Target URL is not a live listing: ${urlToCheck}`);
+        return;
+    }
+    
+    log.info(`Target property has a live listing URL: ${urlToCheck}`);
+    
+    // Extract asking price from listing
+    const askingPriceResult = await extractAskingPrice(urlToCheck);
+    
+    if (!askingPriceResult) {
+        log.warning('Could not extract asking price from target listing');
+        return;
+    }
+    
+    log.info(`Extracted asking price: ${askingPriceResult.priceText} from ${askingPriceResult.source}`);
+    
+    // Update target property with asking price
+    target.Price = askingPriceResult.price;
+    target._askingPrice = true; // Flag to indicate this is an asking price, not sold price
+    
+    // Calculate £/sqft if floor area is available
+    if (target['Sq. ft'] && target['Sq. ft'] > 0) {
+        const pricePerSqft = calculatePricePerSqft(askingPriceResult.price, target['Sq. ft']);
+        if (pricePerSqft) {
+            target['£/sqft'] = pricePerSqft;
+            log.info(`Calculated £/sqft: ${pricePerSqft} (${askingPriceResult.priceText} / ${target['Sq. ft']} sq ft)`);
+        }
+    } else {
+        log.warning('Floor area not available for target property - cannot calculate £/sqft');
+    }
 }
 
 /**

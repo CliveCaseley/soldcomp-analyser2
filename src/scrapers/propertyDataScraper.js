@@ -218,6 +218,23 @@ async function scrapePropertyData(url) {
             data.Image_URL = imageUrl;
         }
 
+        // BATCH 3: Extract Rightmove URL if present
+        // PropertyData transaction pages sometimes contain links to Rightmove listings
+        // Example: href="https://www.rightmove.co.uk/house-prices/details/..." target="_blank">
+        //          <i class="far fa-external-link mr-1"></i> View on portal</a>
+        const rightmoveLinks = $('a[href*="rightmove.co.uk"]');
+        if (rightmoveLinks.length > 0) {
+            const rightmoveUrl = rightmoveLinks.first().attr('href');
+            if (rightmoveUrl) {
+                data.URL_Rightmove = rightmoveUrl;
+                log.info(`Found Rightmove URL: ${rightmoveUrl}`);
+            }
+        }
+        
+        // BATCH 3: Store PropertyData URL for reference
+        // This will be used to create separate URL columns in Excel
+        data.URL_PropertyData = url;
+
         log.info(`Successfully scraped PropertyData: ${data.Address || 'Unknown address'}`);
         return data;
         
