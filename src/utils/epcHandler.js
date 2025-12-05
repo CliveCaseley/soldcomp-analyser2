@@ -128,27 +128,48 @@ async function scrapeCertificateNumbersFromPostcode(postcode) {
  * @returns {Promise<Object|null>} Certificate data with number or null
  */
 async function getCertificateNumber(postcode, address, apiKey = null) {
+    log.info('═'.repeat(80));
+    log.info('🔎 EPC CERTIFICATE LOOKUP');
+    log.info('═'.repeat(80));
+    
     if (!postcode) {
-        log.warning('Cannot look up certificate number: missing postcode');
+        log.warning('⚠️ Cannot look up certificate number: missing postcode');
         return null;
     }
     
-    log.info(`Looking up certificate number via web scraping: ${postcode}`);
+    if (!address) {
+        log.warning('⚠️ Cannot look up certificate number: missing address');
+        return null;
+    }
+    
+    log.info(`📮 Postcode: ${postcode}`);
+    log.info(`🏠 Address: "${address}"`);
+    log.info(`🌐 Looking up certificate number via web scraping...`);
+    log.info('');
     
     try {
         // Scrape certificate numbers from postcode search page
         const certificates = await scrapeCertificateNumbersFromPostcode(postcode);
         
         if (certificates.length === 0) {
-            log.warning('No certificates found for postcode');
+            log.warning('❌ No certificates found for postcode');
             return null;
         }
+        
+        log.info(`📊 Found ${certificates.length} certificates for postcode ${postcode}`);
+        log.info('');
         
         // Find best matching address
         const bestMatch = findBestAddressMatchFromScrapedData(certificates, address);
         
         if (bestMatch) {
-            log.info(`Found matching certificate: ${bestMatch.certificateNumber} for ${bestMatch.address}`);
+            log.info('');
+            log.info('✅ CERTIFICATE LOOKUP SUCCESS');
+            log.info(`   Certificate: ${bestMatch.certificateNumber}`);
+            log.info(`   Address: "${bestMatch.address}"`);
+            log.info(`   URL: ${bestMatch.href}`);
+            log.info('═'.repeat(80));
+            
             return {
                 certificateNumber: bestMatch.certificateNumber,
                 certificateURL: bestMatch.href,
@@ -158,8 +179,13 @@ async function getCertificateNumber(postcode, address, apiKey = null) {
         }
         
         // If no good match, return first result as fallback
-        log.info('No exact address match, returning first result as fallback');
+        log.warning('⚠️ findBestAddressMatchFromScrapedData returned null');
+        log.warning('⚠️ Falling back to first certificate');
         const fallback = certificates[0];
+        log.info(`   Fallback Certificate: ${fallback.certificateNumber}`);
+        log.info(`   Fallback Address: "${fallback.address}"`);
+        log.info('═'.repeat(80));
+        
         return {
             certificateNumber: fallback.certificateNumber,
             certificateURL: fallback.href,
@@ -168,7 +194,8 @@ async function getCertificateNumber(postcode, address, apiKey = null) {
         };
         
     } catch (error) {
-        log.warning(`Failed to get certificate number: ${error.message}`);
+        log.warning(`❌ Failed to get certificate number: ${error.message}`);
+        log.error(error.stack);
         return null;
     }
 }
@@ -270,45 +297,82 @@ function scoreHouseNumberMatch(target, candidate) {
 }
 
 /**
+ * Normalize text for matching by removing punctuation and extra whitespace
+ * @param {string} text - Text to normalize
+ * @returns {string} Normalized text
+ */
+function normalizeTextForMatching(text) {
+    if (!text) return '';
+    return text
+        .toLowerCase()
+        .replace(/[,;:.!?]/g, ' ') // Replace punctuation with spaces
+        .replace(/\s+/g, ' ') // Collapse multiple spaces
+        .trim();
+}
+
+/**
  * Find best matching address from scraped certificate data
- * IMPROVED VERSION (Batch 1 - Issue 5): Better house number extraction and matching
+ * IMPROVED VERSION (v2.6): Enhanced punctuation handling and logging
  * 
  * @param {Array} certificates - Array of certificate objects from scraping
  * @param {string} targetAddress - Target address to match
  * @returns {Object} Best matching certificate or null
  */
 function findBestAddressMatchFromScrapedData(certificates, targetAddress) {
-    if (!targetAddress || !certificates || certificates.length === 0) {
-        return certificates[0]; // Return first result if no address to match
+    // DEFENSIVE: Check for empty certificates array
+    if (!certificates || certificates.length === 0) {
+        log.warning('⚠️ No certificates provided to match against');
+        return null;
     }
     
-    log.info(`Matching target address: "${targetAddress}"`);
+    // DEFENSIVE: Check for missing target address
+    if (!targetAddress || targetAddress.trim() === '') {
+        log.warning('⚠️ No target address provided, returning first certificate as fallback');
+        return certificates[0];
+    }
     
-    const normalizedTarget = targetAddress.toLowerCase().trim();
+    log.info(`🔍 Matching target address: "${targetAddress}"`);
+    log.info(`📋 Total certificates to compare: ${certificates.length}`);
+    
+    const normalizedTarget = normalizeTextForMatching(targetAddress);
     const targetHouseNum = extractHouseNumber(targetAddress);
     
-    log.info(`Extracted target house number: ${JSON.stringify(targetHouseNum)}`);
+    log.info(`🏠 Extracted target house number: ${JSON.stringify(targetHouseNum)}`);
+    log.info(`📝 Normalized target: "${normalizedTarget}"`);
     
     let bestMatch = null;
     let bestScore = 0;
+    let matchesWithScores = [];
     
     for (const cert of certificates) {
-        const certAddress = cert.address.toLowerCase().trim();
-        const certHouseNum = extractHouseNumber(cert.address);
+        const certAddress = cert.address;
+        const normalizedCertAddr = normalizeTextForMatching(certAddress);
+        const certHouseNum = extractHouseNumber(certAddress);
         
         // Calculate house number match score (weight: 70%)
         const houseNumScore = scoreHouseNumberMatch(targetHouseNum, certHouseNum);
         
         // Calculate street name match score (weight: 30%)
-        const targetWords = normalizedTarget.split(/\s+/).filter(w => w.length > 2); // Filter short words
-        const certWords = certAddress.split(/\s+/).filter(w => w.length > 2);
-        const wordMatches = targetWords.filter(word => certWords.includes(word)).length;
-        const streetScore = targetWords.length > 0 ? wordMatches / targetWords.length : 0;
+        // Improved: use normalized text (punctuation removed) and filter short words
+        const targetWords = normalizedTarget.split(/\s+/).filter(w => w.length > 2);
+        const certWords = normalizedCertAddr.split(/\s+/).filter(w => w.length > 2);
+        const wordMatches = targetWords.filter(word => certWords.includes(word));
+        const streetScore = targetWords.length > 0 ? wordMatches.length / targetWords.length : 0;
         
-        // Combined score: prioritize house number matching
+        // Combined score: prioritize house number matching (70/30 split)
         const totalScore = (houseNumScore * 0.7) + (streetScore * 0.3);
         
-        log.info(`  Candidate: "${cert.address}" - House#: ${certHouseNum.primary}${certHouseNum.flat || ''}, Score: ${totalScore.toFixed(2)} (house: ${houseNumScore.toFixed(2)}, street: ${streetScore.toFixed(2)})`);
+        // Store for debugging
+        matchesWithScores.push({
+            cert: cert,
+            houseNum: certHouseNum.primary,
+            totalScore: totalScore,
+            houseNumScore: houseNumScore,
+            streetScore: streetScore
+        });
+        
+        log.info(`  📍 Candidate: "${cert.address}"`);
+        log.info(`     House#: ${certHouseNum.primary}${certHouseNum.flat || ''}, Total: ${totalScore.toFixed(3)}, House: ${houseNumScore.toFixed(3)}, Street: ${streetScore.toFixed(3)}`);
         
         if (totalScore > bestScore) {
             bestScore = totalScore;
@@ -316,12 +380,29 @@ function findBestAddressMatchFromScrapedData(certificates, targetAddress) {
         }
     }
     
-    // Only return match if score > 40% (lowered threshold due to weighted scoring)
-    if (bestScore > 0.4 && bestMatch) {
-        log.info(`✓ Selected best match: "${bestMatch.address}" (score: ${bestScore.toFixed(2)})`);
+    // Log top 5 matches for debugging
+    log.info('');
+    log.info('🏆 Top 5 Matches:');
+    matchesWithScores
+        .sort((a, b) => b.totalScore - a.totalScore)
+        .slice(0, 5)
+        .forEach((m, idx) => {
+            log.info(`  ${idx + 1}. House ${m.houseNum} - Score: ${m.totalScore.toFixed(3)} (house: ${m.houseNumScore.toFixed(3)}, street: ${m.streetScore.toFixed(3)})`);
+        });
+    log.info('');
+    
+    // CRITICAL FIX: Lower threshold from 0.4 to 0.3 for better matching
+    // This helps in cases where street names have slight variations
+    const SCORE_THRESHOLD = 0.3;
+    
+    if (bestScore > SCORE_THRESHOLD && bestMatch) {
+        log.info(`✅ Selected best match: "${bestMatch.address}"`);
+        log.info(`   Certificate: ${bestMatch.certificateNumber}`);
+        log.info(`   Final Score: ${bestScore.toFixed(3)}`);
         return bestMatch;
     } else {
-        log.warning(`✗ No good match found (best score: ${bestScore.toFixed(2)}), returning first result as fallback`);
+        log.warning(`❌ No good match found (best score: ${bestScore.toFixed(3)}, threshold: ${SCORE_THRESHOLD})`);
+        log.warning(`⚠️ Falling back to first certificate: "${certificates[0].address}"`);
         return certificates[0];
     }
 }
@@ -629,5 +710,6 @@ module.exports = {
     findBestAddressMatchFromScrapedData,
     scrapeFloorAreaFromCertificate,
     extractHouseNumber,
-    scoreHouseNumberMatch
+    scoreHouseNumberMatch,
+    normalizeTextForMatching
 };
