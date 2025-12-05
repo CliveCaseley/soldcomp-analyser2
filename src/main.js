@@ -12,6 +12,7 @@ const { detectAndMergeDuplicates } = require('./utils/duplicateDetector');
 const { addHyperlinks } = require('./utils/excelHelper');
 const { readCSVFromKVS, writeCSVToKVS } = require('./utils/kvsHandler');
 const { sanitizeProperties } = require('./utils/dataSanitizer');
+const { detectManualEdits } = require('./utils/manualEditDetector');
 
 /**
  * Main actor entry point
@@ -88,6 +89,14 @@ Actor.main(async () => {
         // Step 9: Detect and merge duplicates
         log.info('=== STEP 8: Detecting duplicates ===');
         allProperties = detectAndMergeDuplicates(allProperties);
+        
+        // Step 9.5: Detect manual edits before enrichment (BATCH 2)
+        log.info('=== STEP 8.5: Detecting manual edits ===');
+        for (const property of allProperties) {
+            detectManualEdits(property);
+        }
+        // Also check target property
+        detectManualEdits(target);
         
         // Step 10: Geocode properties and calculate distances
         if (GOOGLE_API_KEY) {
@@ -308,11 +317,17 @@ async function geocodeAndCalculateDistances(properties, target, apiKey) {
  * - Automatically scrapes floor area from certificate pages
  * - Falls back to direct certificate scraping if initial attempt failed
  * 
+ * BATCH 2 ENHANCEMENT: Preserve manual edits
+ * - Checks for manual edits before overwriting fields
+ * - Preserves user corrections (e.g., manually corrected EPC URLs)
+ * - Compares scraped vs existing data to detect manual changes
+ * 
  * @param {Array<Object>} properties - Properties to enrich
  * @param {string} apiKey - EPC API key
  */
 async function enrichWithEPCData(properties, apiKey) {
     const { scrapeFloorAreaFromCertificate } = require('./utils/epcHandler');
+    const { compareAndMarkEPCEdit, compareAndMarkSqftEdit, canUpdateField } = require('./utils/manualEditDetector');
     
     for (const property of properties) {
         if (!property.Postcode) continue;
@@ -326,10 +341,20 @@ async function enrichWithEPCData(properties, apiKey) {
                     property['EPC rating'] = epcData.rating;
                 }
                 
-                // Store individual certificate URL in dedicated column
+                // BATCH 2: Check if EPC Certificate is manually edited before updating
                 if (epcData.certificateURL) {
-                    property['EPC Certificate'] = epcData.certificateURL;
-                    log.info(`  EPC Certificate URL: ${epcData.certificateURL}`);
+                    // If property already has EPC Certificate, check for manual edit
+                    if (property['EPC Certificate']) {
+                        compareAndMarkEPCEdit(property, epcData.certificateURL);
+                    }
+                    
+                    // Only update if not manually edited
+                    if (canUpdateField(property, 'EPC Certificate')) {
+                        property['EPC Certificate'] = epcData.certificateURL;
+                        log.info(`  EPC Certificate URL: ${epcData.certificateURL}`);
+                    } else {
+                        log.info(`  ✓ Preserving manually edited EPC Certificate: ${property['EPC Certificate']}`);
+                    }
                 }
                 
                 // BATCH 1 ENHANCEMENT: Use EPC floor area as arbiter for conflicts
@@ -344,32 +369,42 @@ async function enrichWithEPCData(properties, apiKey) {
                 if (epcFloorAreaSqm) {
                     const epcSqFt = Math.round(epcFloorAreaSqm / 0.092903);
                     
+                    // BATCH 2: Check for manual edit on square footage before updating
+                    if (property['Sq. ft']) {
+                        compareAndMarkSqftEdit(property, epcSqFt);
+                    }
+                    
                     // Check if this property has a floor area conflict from duplicate merging
                     if (property._floorAreaConflict) {
                         log.info(`  ✓ Resolving floor area conflict with EPC data...`);
                         log.info(`    Conflicting values: ${property._floorAreaConflict.value1} vs ${property._floorAreaConflict.value2}`);
                         log.info(`    EPC arbiter value: ${epcSqFt} sq ft (${epcFloorAreaSqm} sqm)`);
                         
-                        // Use EPC floor area as the authoritative source
-                        property['Sq. ft'] = epcSqFt;
-                        property.Sqm = epcFloorAreaSqm;
-                        
-                        // Update needs_review flag to indicate resolution
-                        if (property.needs_review) {
-                            property.needs_review = property.needs_review.replace(
-                                /Sq\. ft conflict: [^;]+/g,
-                                `Floor area resolved by EPC: ${epcSqFt} sqft`
-                            );
-                            property.needs_review = property.needs_review.replace(
-                                /Sqm conflict: [^;]+/g,
-                                `Floor area resolved by EPC: ${epcFloorAreaSqm} sqm`
-                            );
+                        // BATCH 2: Only update if not manually edited
+                        if (canUpdateField(property, 'Sq. ft')) {
+                            // Use EPC floor area as the authoritative source
+                            property['Sq. ft'] = epcSqFt;
+                            property.Sqm = epcFloorAreaSqm;
+                            
+                            // Update needs_review flag to indicate resolution
+                            if (property.needs_review) {
+                                property.needs_review = property.needs_review.replace(
+                                    /Sq\. ft conflict: [^;]+/g,
+                                    `Floor area resolved by EPC: ${epcSqFt} sqft`
+                                );
+                                property.needs_review = property.needs_review.replace(
+                                    /Sqm conflict: [^;]+/g,
+                                    `Floor area resolved by EPC: ${epcFloorAreaSqm} sqm`
+                                );
+                            }
+                            
+                            // Clean up conflict marker
+                            delete property._floorAreaConflict;
+                            
+                            log.info(`  ✓ Conflict resolved using EPC floor area`);
+                        } else {
+                            log.info(`  ✓ Preserving manually edited square footage: ${property['Sq. ft']} sq ft`);
                         }
-                        
-                        // Clean up conflict marker
-                        delete property._floorAreaConflict;
-                        
-                        log.info(`  ✓ Conflict resolved using EPC floor area`);
                     }
                     // Otherwise, use EPC floor area if property doesn't have it
                     else if (!property['Sq. ft']) {
@@ -393,14 +428,18 @@ async function enrichWithEPCData(properties, apiKey) {
  * - Calculates Sqm from Sq. ft for ANY property that has floor area
  * - Previously only calculated during CSV parsing or PropertyData scraping
  * 
+ * BATCH 2 ENHANCEMENT: Respect manual edits
+ * - Does not recalculate if fields are manually edited
+ * 
  * @param {Array<Object>} properties - Properties to finalize
  */
 function finalizePropertyData(properties) {
+    const { canUpdateField } = require('./utils/manualEditDetector');
     let sqmCalculated = 0;
     
     for (const property of properties) {
-        // Calculate Sqm from Sq. ft if missing
-        if (property['Sq. ft'] && !property.Sqm) {
+        // Calculate Sqm from Sq. ft if missing (and not manually edited)
+        if (property['Sq. ft'] && !property.Sqm && canUpdateField(property, 'Sqm')) {
             const sqft = parseFloat(property['Sq. ft']);
             if (!isNaN(sqft) && sqft > 0) {
                 property.Sqm = Math.round(sqft * 0.092903); // 1 sq ft = 0.092903 sqm
