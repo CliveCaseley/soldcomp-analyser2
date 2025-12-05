@@ -293,6 +293,99 @@ function findBestAddressMatch(results, targetAddress) {
 }
 
 /**
+ * ENHANCEMENT D: Scrape floor area from EPC certificate page
+ * Extracts floor area (in sqm) from individual EPC certificate pages
+ * 
+ * @param {string} certificateURL - Full URL to EPC certificate page
+ * @returns {Promise<number|null>} Floor area in square meters, or null if not found
+ */
+async function scrapeFloorAreaFromCertificate(certificateURL) {
+    if (!certificateURL) {
+        return null;
+    }
+    
+    log.info(`Scraping floor area from certificate: ${certificateURL}`);
+    
+    try {
+        const response = await axios.get(certificateURL, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            },
+            timeout: 10000
+        });
+        
+        const $ = cheerio.load(response.data);
+        
+        // Look for floor area in the certificate page
+        // Floor area is typically displayed in various formats:
+        // "Total floor area: 123 m²"
+        // "Total floor area   123 square metres"
+        
+        let floorArea = null;
+        
+        // Method 1: Look for dt/dd pairs with "Total floor area"
+        $('dt').each((i, elem) => {
+            const label = $(elem).text().trim().toLowerCase();
+            if (label.includes('total floor area') || label.includes('floor area')) {
+                const value = $(elem).next('dd').text().trim();
+                const match = value.match(/(\d+(?:\.\d+)?)/);
+                if (match) {
+                    floorArea = parseFloat(match[1]);
+                    log.info(`Found floor area (dt/dd): ${floorArea} sqm`);
+                    return false; // break
+                }
+            }
+        });
+        
+        // Method 2: Look for text containing "floor area" and extract number
+        if (!floorArea) {
+            $('p, div, span, td, th').each((i, elem) => {
+                const text = $(elem).text().trim();
+                if (text.toLowerCase().includes('total floor area') || text.toLowerCase().includes('floor area')) {
+                    const match = text.match(/(\d+(?:\.\d+)?)\s*(?:m²|m2|square\s+metres?|sqm)/i);
+                    if (match) {
+                        floorArea = parseFloat(match[1]);
+                        log.info(`Found floor area (text search): ${floorArea} sqm`);
+                        return false; // break
+                    }
+                }
+            });
+        }
+        
+        // Method 3: Look in table rows for floor area
+        if (!floorArea) {
+            $('tr').each((i, elem) => {
+                const rowText = $(elem).text().trim().toLowerCase();
+                if (rowText.includes('floor area')) {
+                    const cells = $(elem).find('td');
+                    if (cells.length > 1) {
+                        const value = cells.last().text().trim();
+                        const match = value.match(/(\d+(?:\.\d+)?)/);
+                        if (match) {
+                            floorArea = parseFloat(match[1]);
+                            log.info(`Found floor area (table): ${floorArea} sqm`);
+                            return false; // break
+                        }
+                    }
+                }
+            });
+        }
+        
+        if (floorArea && floorArea > 0) {
+            log.info(`Successfully scraped floor area: ${floorArea} sqm from ${certificateURL}`);
+            return floorArea;
+        } else {
+            log.warning(`Could not find floor area in certificate page: ${certificateURL}`);
+            return null;
+        }
+        
+    } catch (error) {
+        log.warning(`Failed to scrape floor area from certificate: ${error.message}`);
+        return null;
+    }
+}
+
+/**
  * Try to scrape EPC rating for a property (fallback method)
  * @param {string} postcode - Property postcode
  * @param {string} address - Property address
@@ -306,6 +399,13 @@ async function scrapeEPCData(postcode, address, apiKey = null) {
     if (apiKey) {
         const apiData = await fetchEPCDataViaAPI(postcode, address, apiKey);
         if (apiData) {
+            // ENHANCEMENT D: Scrape floor area from certificate if URL is available
+            if (apiData.certificateURL && !apiData.floorArea) {
+                const scrapedFloorArea = await scrapeFloorAreaFromCertificate(apiData.certificateURL);
+                if (scrapedFloorArea) {
+                    apiData.floorArea = scrapedFloorArea;
+                }
+            }
             return apiData;
         }
     }
@@ -346,9 +446,17 @@ async function scrapeEPCData(postcode, address, apiKey = null) {
 
         if (epcRating) {
             log.info(`Found EPC rating via scraping: ${epcRating}`);
+            
+            // ENHANCEMENT D: Scrape floor area from certificate if URL is available
+            let floorArea = null;
+            if (certificateURL) {
+                floorArea = await scrapeFloorAreaFromCertificate(certificateURL);
+            }
+            
             return { 
                 rating: epcRating, 
                 certificateURL: certificateURL || null,
+                floorArea: floorArea,
                 searchURL: url 
             };
         } else {
@@ -399,5 +507,6 @@ module.exports = {
     isValidCertificateNumber,
     getCertificateNumber,
     scrapeCertificateNumbersFromPostcode,
-    findBestAddressMatchFromScrapedData
+    findBestAddressMatchFromScrapedData,
+    scrapeFloorAreaFromCertificate
 };
