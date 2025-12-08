@@ -58,11 +58,39 @@ Actor.main(async () => {
         log.info('=== STEP 3.5: Sanitizing data (removing JS/HTML, validating values) ===');
         properties = sanitizeProperties(properties);
         
+        // Step 4.6: CRITICAL FIX - Remove EPC Lookup rows from input
+        // These should NEVER exist in input files - they are created by the code
+        // When output CSV is used as input (iterative processing), EPC Lookup rows get read back
+        // and must be filtered out to prevent corruption
+        log.info('=== STEP 3.6: Filtering EPC Lookup rows from input ===');
+        const beforeFilterCount = properties.length;
+        properties = properties.filter(p => {
+            const isEPCLookup = p.Address === 'EPC Lookup' || p._isEPCLookupRow;
+            if (isEPCLookup) {
+                log.warning(`⚠️ Removing EPC Lookup row from input: Postcode=${p.Postcode}`);
+            }
+            return !isEPCLookup;
+        });
+        const filteredCount = beforeFilterCount - properties.length;
+        if (filteredCount > 0) {
+            log.warning(`❌ CRITICAL: Removed ${filteredCount} EPC Lookup rows from input!`);
+            log.warning(`   This indicates output CSV was used as input (iterative processing)`);
+            log.warning(`   EPC Lookup rows should only be created by the code, not in input files`);
+        } else {
+            log.info(`✅ No EPC Lookup rows found in input (correct)`);
+        }
+        
         // Step 5: Find target property (CRITICAL)
         log.info('=== STEP 4: Finding target property ===');
         const { target, comparables } = findTarget(properties, preHeaderRows);
         log.info(`Target property: ${target.Address}, ${target.Postcode}`);
         log.info(`Comparable properties: ${comparables.length}`);
+        
+        // Step 5.1: CRITICAL FIX - Preserve target URL
+        // Store original target URL before any processing that might overwrite it
+        const originalTargetURL = target.URL;
+        log.info(`💾 Preserving target URL: ${originalTargetURL || 'N/A'}`);
+        target._originalURL = originalTargetURL; // Store for protection
         
         // Step 6: Classify URLs
         log.info('=== STEP 5: Classifying URLs ===');
@@ -118,6 +146,32 @@ Actor.main(async () => {
         log.info('=== STEP 10.5: Final data processing (Sqm calculation) ===');
         finalizePropertyData(allProperties);
         finalizePropertyData([target]); // Also finalize target
+        
+        // Step 11.6: CRITICAL FIX - Post-enrichment duplicate detection
+        // Duplicates can be created DURING scraping/enrichment from different data sources
+        // Run duplicate detection AGAIN after all enrichment is complete
+        log.info('=== STEP 10.6: Post-enrichment duplicate detection ===');
+        const beforePostDedup = allProperties.length;
+        allProperties = detectAndMergeDuplicates(allProperties);
+        const afterPostDedup = allProperties.length;
+        const removedPostEnrichment = beforePostDedup - afterPostDedup;
+        if (removedPostEnrichment > 0) {
+            log.warning(`⚠️ Removed ${removedPostEnrichment} duplicates created during enrichment`);
+        } else {
+            log.info(`✅ No additional duplicates found after enrichment`);
+        }
+        
+        // Step 11.7: CRITICAL FIX - Restore target URL
+        // Ensure target URL is preserved even if it was overwritten during processing
+        if (target._originalURL && target.URL !== target._originalURL) {
+            log.warning(`⚠️ Target URL was modified during processing!`);
+            log.warning(`   Original: ${target._originalURL}`);
+            log.warning(`   Modified: ${target.URL}`);
+            log.warning(`   ✅ Restoring original URL`);
+            target.URL = target._originalURL;
+        } else if (target._originalURL) {
+            log.info(`✅ Target URL preserved correctly: ${target.URL}`);
+        }
         
         // Step 12: Rank comparable properties
         log.info('=== STEP 11: Ranking comparable properties ===');
@@ -223,6 +277,15 @@ function mergeScrapedData(existing, scraped) {
  * @param {string} apiKey - Google API key
  */
 async function geocodeAndCalculateDistances(properties, target, apiKey) {
+    // CRITICAL FIX: Filter out EPC Lookup rows before geocoding
+    const propertiesToGeocode = properties.filter(p => 
+        p.Address !== 'EPC Lookup' && !p._isEPCLookupRow
+    );
+    const skipped = properties.length - propertiesToGeocode.length;
+    if (skipped > 0) {
+        log.warning(`⚠️ Skipped ${skipped} EPC Lookup rows from geocoding`);
+    }
+    
     // Geocode target property first (or use existing coordinates)
     log.info('Geocoding target property...');
     let targetGeocode;
@@ -252,8 +315,8 @@ async function geocodeAndCalculateDistances(properties, target, apiKey) {
     target['Google Streetview URL'] = targetStreetviewURL;
     target['Google Streetview Link'] = `=HYPERLINK("${targetStreetviewURL}", "View Map")`;
     
-    // Geocode all comparable properties
-    for (const property of properties) {
+    // Geocode all comparable properties (excluding EPC Lookup rows)
+    for (const property of propertiesToGeocode) {
         if (!property.Address || !property.Postcode) {
             log.warning(`Skipping geocoding for property without address/postcode`);
             property.needs_review = 1;
@@ -329,7 +392,16 @@ async function enrichWithEPCData(properties, apiKey) {
     const { scrapeFloorAreaFromCertificate } = require('./utils/epcHandler');
     const { compareAndMarkEPCEdit, compareAndMarkSqftEdit, canUpdateField } = require('./utils/manualEditDetector');
     
-    for (const property of properties) {
+    // CRITICAL FIX: Filter out EPC Lookup rows before EPC enrichment
+    const propertiesToEnrich = properties.filter(p => 
+        p.Address !== 'EPC Lookup' && !p._isEPCLookupRow
+    );
+    const skipped = properties.length - propertiesToEnrich.length;
+    if (skipped > 0) {
+        log.warning(`⚠️ Skipped ${skipped} EPC Lookup rows from EPC enrichment`);
+    }
+    
+    for (const property of propertiesToEnrich) {
         if (!property.Postcode) continue;
         
         try {

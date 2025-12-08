@@ -3,6 +3,36 @@ const fuzzball = require('fuzzball');
 const { log } = require('apify');
 
 /**
+ * CRITICAL FIX: Clean UTF-8 encoding issues
+ * When UTF-8 files are misinterpreted as ISO-8859-1, characters like £ become Â£
+ * This function fixes common encoding issues
+ * 
+ * @param {string} text - Text to clean
+ * @returns {string} Cleaned text
+ */
+function cleanUTF8Encoding(text) {
+    if (typeof text !== 'string') return text;
+    
+    // Fix common UTF-8 misinterpretations
+    let cleaned = text;
+    
+    // Â£ → £ (most common issue)
+    cleaned = cleaned.replace(/Â£/g, '£');
+    
+    // Other common patterns
+    cleaned = cleaned.replace(/Ã‚Â£/g, '£'); // Double encoding
+    cleaned = cleaned.replace(/â‚¬/g, '€');  // Euro sign
+    cleaned = cleaned.replace(/Â°/g, '°');   // Degree symbol
+    cleaned = cleaned.replace(/â€"/g, '–');  // En dash
+    cleaned = cleaned.replace(/â€"/g, '—');  // Em dash
+    cleaned = cleaned.replace(/â€™/g, "'");  // Right single quotation mark
+    cleaned = cleaned.replace(/â€œ/g, '"');  // Left double quotation mark
+    cleaned = cleaned.replace(/â€/g, '"');   // Right double quotation mark
+    
+    return cleaned;
+}
+
+/**
  * Standard schema for property data
  * 
  * CRITICAL UPDATE (v2.1): Added Latitude, Longitude, and EPC Certificate columns
@@ -94,6 +124,9 @@ function isURL(str) {
  */
 function parseCSV(csvContent) {
     log.info('Parsing CSV content...');
+    
+    // CRITICAL FIX: Clean UTF-8 encoding issues before parsing
+    csvContent = cleanUTF8Encoding(csvContent);
     
     try {
         // Parse CSV with automatic header detection
