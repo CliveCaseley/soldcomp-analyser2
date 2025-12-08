@@ -477,6 +477,28 @@ function finalizePropertyData(properties) {
  * 5. PropertyData listings (ranked comparables)
  */
 function prepareOutput(properties, target) {
+    // ═══════════════════════════════════════════════════════════
+    // DEBUG LOGGING - Track output preparation
+    // ═══════════════════════════════════════════════════════════
+    log.info('');
+    log.info('═'.repeat(80));
+    log.info('📋 PREPARING OUTPUT');
+    log.info('═'.repeat(80));
+    log.info(`Total properties to process: ${properties.length}`);
+    log.info(`Target property: "${target.Address}", ${target.Postcode}`);
+    log.info('');
+    
+    // CRITICAL VALIDATION: Check if any property already has "EPC Lookup" as address
+    const epcLookupProperties = properties.filter(p => p.Address === 'EPC Lookup');
+    if (epcLookupProperties.length > 0) {
+        log.error('❌❌❌ CORRUPTION DETECTED IN INPUT:');
+        log.error(`   Found ${epcLookupProperties.length} properties with Address="EPC Lookup"`);
+        log.error('   These should NOT exist before EPC lookup row is created!');
+        epcLookupProperties.forEach((p, idx) => {
+            log.error(`   Property ${idx + 1}: Postcode=${p.Postcode}, URL=${p.URL?.substring(0, 50)}`);
+        });
+    }
+    
     const output = [];
     
     // Separate different types of rows based on _source metadata
@@ -501,14 +523,26 @@ function prepareOutput(properties, target) {
         !propertydataListings.includes(p)
     );
     
+    log.info('Property categories:');
+    log.info(`  - Rightmove postcode searches: ${rightmovePostcodeSearches.length}`);
+    log.info(`  - Rightmove individual listings: ${rightmoveIndividualListings.length}`);
+    log.info(`  - PropertyData listings: ${propertydataListings.length}`);
+    log.info(`  - Comparables: ${comparables.length}`);
+    log.info('');
+    
     // 1. Add Rightmove postcode search URLs (no ranking)
-    rightmovePostcodeSearches.forEach(p => {
+    log.info('Adding Rightmove postcode searches...');
+    rightmovePostcodeSearches.forEach((p, idx) => {
         p.Ranking = ''; // No ranking for URL-only rows
+        log.info(`  ${idx + 1}. "${p.Address || 'No address'}" (${p.Postcode})`);
         output.push(p);
     });
     
     // 2. Add EPC lookup row
+    log.info('');
+    log.info('Creating and adding EPC lookup row...');
     const epcLookupRow = createEPCLookupRow(target.Postcode);
+    log.info(`  EPC Lookup row: Address="${epcLookupRow.Address}", Postcode=${epcLookupRow.Postcode}`);
     output.push(epcLookupRow);
     
     // 3. Add target property (no ranking)
@@ -534,6 +568,7 @@ function prepareOutput(properties, target) {
     
     output.push(...rankedComparables);
     
+    log.info('');
     log.info('Output structure per SPEC v01.docx:');
     log.info(`  1. Rightmove postcode search URLs: ${rightmovePostcodeSearches.length}`);
     log.info(`  2. EPC lookup row: 1`);
@@ -542,6 +577,49 @@ function prepareOutput(properties, target) {
     log.info(`  5. PropertyData listings: ${propertydataListings.length}`);
     log.info(`  6. Ranked comparables: ${rankedComparables.length}`);
     log.info(`  Total output rows: ${output.length}`);
+    
+    // ═══════════════════════════════════════════════════════════
+    // CRITICAL VALIDATION: Verify final output integrity
+    // ═══════════════════════════════════════════════════════════
+    log.info('');
+    log.info('🔍 VALIDATING FINAL OUTPUT...');
+    
+    // Check for corrupted addresses
+    const corruptedProperties = output.filter(p => 
+        p.Address === 'EPC Lookup' && !p._isEPCLookupRow
+    );
+    
+    if (corruptedProperties.length > 0) {
+        log.error('❌❌❌ CRITICAL CORRUPTION DETECTED IN FINAL OUTPUT!');
+        log.error(`   Found ${corruptedProperties.length} properties with corrupted addresses`);
+        corruptedProperties.forEach((p, idx) => {
+            log.error(`   Corrupted ${idx + 1}: Address="${p.Address}", Postcode=${p.Postcode}, URL=${p.URL?.substring(0, 50)}`);
+        });
+    }
+    
+    // Verify EPC Lookup row exists and is correct
+    const epcLookupRows = output.filter(p => p._isEPCLookupRow);
+    if (epcLookupRows.length === 0) {
+        log.warning('⚠️ WARNING: No EPC Lookup row found in output!');
+    } else if (epcLookupRows.length > 1) {
+        log.warning(`⚠️ WARNING: Multiple EPC Lookup rows found: ${epcLookupRows.length}`);
+    } else {
+        log.info(`✅ EPC Lookup row: OK (Address="${epcLookupRows[0].Address}", Postcode=${epcLookupRows[0].Postcode})`);
+    }
+    
+    // Verify target property
+    const targetInOutput = output.find(p => p === target);
+    if (targetInOutput) {
+        log.info(`✅ Target property: OK (Address="${targetInOutput.Address}", Postcode=${targetInOutput.Postcode})`);
+        if (targetInOutput.Address === 'EPC Lookup') {
+            log.error('❌❌❌ TARGET PROPERTY CORRUPTED! Address is "EPC Lookup"!');
+        }
+    } else {
+        log.error('❌ Target property NOT found in output!');
+    }
+    
+    log.info('═'.repeat(80));
+    log.info('');
     
     return output;
 }
