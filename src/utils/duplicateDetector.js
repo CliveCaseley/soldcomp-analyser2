@@ -46,12 +46,29 @@ const { log } = require('apify');
  */
 function detectAndMergeDuplicates(properties) {
     log.info('Detecting duplicates...');
+    log.info(`Total properties to process: ${properties.length}`);
     
     const uniqueProperties = [];
     const seenKeys = new Map(); // Map of key -> index in uniqueProperties
     const seenURLs = new Map(); // Map of URL -> index in uniqueProperties
     
-    properties.forEach(property => {
+    properties.forEach((property, index) => {
+        // ═══════════════════════════════════════════════════════════
+        // DEBUG LOGGING - Track property processing
+        // ═══════════════════════════════════════════════════════════
+        log.info(`\n🔍 Processing property ${index + 1}/${properties.length}:`);
+        log.info(`   Address: "${property.Address || 'EMPTY'}"`);
+        log.info(`   Postcode: "${property.Postcode || 'EMPTY'}"`);
+        log.info(`   isTarget: ${property.isTarget || 0}`);
+        
+        // CRITICAL VALIDATION: Skip duplicate detection for "EPC Lookup" row
+        if (property.Address === 'EPC Lookup' || property._isEPCLookupRow) {
+            log.warning('⚠️ Skipping duplicate detection for "EPC Lookup" row');
+            log.warning('   → This is a special row and should not be merged with anything');
+            uniqueProperties.push(property);
+            return; // Skip to next property
+        }
+        
         let isDuplicate = false;
         let existingIndex = -1;
         
@@ -316,13 +333,58 @@ function hasFloorAreaConflict(value1, value2) {
  * @returns {Object} Merged property
  */
 function mergeProperties(existing, newData) {
+    // ═══════════════════════════════════════════════════════════
+    // DEBUG LOGGING - Track address changes during merge
+    // ═══════════════════════════════════════════════════════════
+    log.info('🔄 MERGE PROPERTIES DEBUG');
+    log.info('━'.repeat(60));
+    log.info(`📝 EXISTING property:`);
+    log.info(`   Address: "${existing.Address || 'EMPTY'}"`);
+    log.info(`   Postcode: "${existing.Postcode || 'EMPTY'}"`);
+    log.info(`   URL: "${(existing.URL || 'EMPTY').substring(0, 50)}..."`);
+    log.info(`   isTarget: ${existing.isTarget || 0}`);
+    log.info(`   _source: ${existing._source || 'none'}`);
+    
+    log.info(`📝 NEW property:`);
+    log.info(`   Address: "${newData.Address || 'EMPTY'}"`);
+    log.info(`   Postcode: "${newData.Postcode || 'EMPTY'}"`);
+    log.info(`   URL: "${(newData.URL || 'EMPTY').substring(0, 50)}..."`);
+    log.info(`   isTarget: ${newData.isTarget || 0}`);
+    log.info(`   _source: ${newData._source || 'none'}`);
+    log.info('━'.repeat(60));
+    
     // Calculate completeness scores
     const existingScore = calculateCompleteness(existing);
     const newScore = calculateCompleteness(newData);
     
+    log.info(`📊 Completeness scores: existing=${existingScore}, new=${newScore}`);
+    
+    // CRITICAL VALIDATION: Never merge with "EPC Lookup" row
+    const existingIsEPCLookup = existing.Address === 'EPC Lookup' || existing._isEPCLookupRow;
+    const newDataIsEPCLookup = newData.Address === 'EPC Lookup' || newData._isEPCLookupRow;
+    
+    if (existingIsEPCLookup || newDataIsEPCLookup) {
+        log.error('❌ CRITICAL: Attempted to merge with "EPC Lookup" row!');
+        log.error(`   Existing is EPC Lookup: ${existingIsEPCLookup}`);
+        log.error(`   New data is EPC Lookup: ${newDataIsEPCLookup}`);
+        log.error('   → Returning property WITHOUT merging to prevent corruption');
+        
+        // Return the non-EPC-Lookup property unchanged
+        if (existingIsEPCLookup) {
+            log.error('   → Keeping NEW data (existing is EPC Lookup)');
+            return newData;
+        } else {
+            log.error('   → Keeping EXISTING data (new is EPC Lookup)');
+            return existing;
+        }
+    }
+    
     // Start with the more complete version as base
     let merged = existingScore >= newScore ? { ...existing } : { ...newData };
     let lesserData = existingScore >= newScore ? newData : existing;
+    
+    log.info(`🎯 Base for merge: ${existingScore >= newScore ? 'EXISTING' : 'NEW'}`);
+    log.info(`   Base Address: "${merged.Address}"`);
     
     // Track if we need to add "Needs Review" flag
     let needsReview = false;
@@ -447,6 +509,24 @@ function mergeProperties(existing, newData) {
     if (merged.URL_Rightmove || merged.URL_PropertyData) {
         log.info(`  → Kept both URLs: RM=${merged.URL_Rightmove ? 'Yes' : 'No'}, PD=${merged.URL_PropertyData ? 'Yes' : 'No'}`);
     }
+    
+    // ═══════════════════════════════════════════════════════════
+    // DEBUG LOGGING - Track final merge result
+    // ═══════════════════════════════════════════════════════════
+    log.info('✅ MERGE RESULT:');
+    log.info(`   Final Address: "${merged.Address || 'EMPTY'}"`);
+    log.info(`   Final Postcode: "${merged.Postcode || 'EMPTY'}"`);
+    log.info(`   Final isTarget: ${merged.isTarget || 0}`);
+    
+    // CRITICAL VALIDATION: Verify address wasn't corrupted
+    if (merged.Address === 'EPC Lookup') {
+        log.error('❌❌❌ CORRUPTION DETECTED: Final merged address is "EPC Lookup"!');
+        log.error('   This should NEVER happen! Investigate immediately!');
+        log.error(`   Original existing: "${existing.Address}"`);
+        log.error(`   Original new: "${newData.Address}"`);
+    }
+    log.info('═'.repeat(60));
+    log.info('');
     
     return merged;
 }

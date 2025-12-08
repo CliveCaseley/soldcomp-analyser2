@@ -675,8 +675,16 @@ async function scrapeEPCData(postcode, address, apiKey = null) {
  * @returns {Object} EPC lookup row data
  */
 function createEPCLookupRow(targetPostcode) {
+    // ═══════════════════════════════════════════════════════════
+    // DEBUG LOGGING - Track EPC Lookup row creation
+    // ═══════════════════════════════════════════════════════════
+    log.info('🔍 CREATING EPC LOOKUP ROW');
+    log.info(`   Postcode: ${targetPostcode}`);
+    log.info(`   Address will be set to: "EPC Lookup"`);
+    log.info('   ⚠️ WARNING: This is a special row that should NOT be merged with real properties!');
+    
     const url = generateEPCSearchURL(targetPostcode);
-    return {
+    const epcLookupRow = {
         'Date of sale': '',
         'Address': 'EPC Lookup',
         'Postcode': targetPostcode,
@@ -696,8 +704,14 @@ function createEPCLookupRow(targetPostcode) {
         'Google Streetview URL': '',
         'isTarget': '',
         'Ranking': '',
-        'needs_review': ''
+        'needs_review': '',
+        '_isEPCLookupRow': true  // Special marker to identify this row
     };
+    
+    log.info(`✅ EPC Lookup row created with URL: ${url}`);
+    log.info('');
+    
+    return epcLookupRow;
 }
 
 module.exports = {
