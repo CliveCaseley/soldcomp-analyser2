@@ -223,6 +223,33 @@ function sanitizeProperty(property) {
 }
 
 /**
+ * Detect widow row (summary row with averages but no actual property data)
+ * Widow rows typically have:
+ * - Empty Address, Postcode, and Date of sale
+ * - But contain numeric values in Price, £/sqft, or other average fields
+ * - Often appear at the end of CSV files as summary statistics
+ * 
+ * @param {Object} property - Property object to check
+ * @returns {boolean} True if this is a widow/summary row
+ */
+function isWidowRow(property) {
+    // Check if critical identifying fields are empty
+    const hasEmptyIdentifiers = (
+        (!property.Address || property.Address.trim() === '') &&
+        (!property.Postcode || property.Postcode.trim() === '') &&
+        (!property['Date of sale'] || property['Date of sale'].trim() === '')
+    );
+    
+    // Check if it has numeric summary data (Price or £/sqft)
+    const hasSummaryData = (
+        (property.Price && !isNaN(parseFloat(property.Price))) ||
+        (property['£/sqft'] && !isNaN(parseFloat(String(property['£/sqft']).replace(/[£,]/g, ''))))
+    );
+    
+    return hasEmptyIdentifiers && hasSummaryData;
+}
+
+/**
  * Sanitize an array of properties
  * @param {Array<Object>} properties - Array of properties
  * @returns {Array<Object>} Array of sanitized properties
@@ -230,7 +257,22 @@ function sanitizeProperty(property) {
 function sanitizeProperties(properties) {
     log.info(`Sanitizing ${properties.length} properties...`);
     
-    const sanitized = properties.map(sanitizeProperty);
+    // Filter out widow/summary rows
+    const beforeWidowFilter = properties.length;
+    const filteredProperties = properties.filter(prop => {
+        if (isWidowRow(prop)) {
+            log.warning(`⚠️ Removing widow/summary row with Price=${prop.Price}, £/sqft=${prop['£/sqft']}`);
+            return false;
+        }
+        return true;
+    });
+    
+    const widowRowsRemoved = beforeWidowFilter - filteredProperties.length;
+    if (widowRowsRemoved > 0) {
+        log.info(`✅ Removed ${widowRowsRemoved} widow/summary row(s) from input`);
+    }
+    
+    const sanitized = filteredProperties.map(sanitizeProperty);
     
     log.info('Data sanitization complete');
     return sanitized;
@@ -244,5 +286,6 @@ module.exports = {
     sanitizeSqFt,
     sanitizeBedrooms,
     sanitizeProperty,
-    sanitizeProperties
+    sanitizeProperties,
+    isWidowRow
 };
