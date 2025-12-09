@@ -358,7 +358,15 @@ function normalizeData(records, headerMapping, headerRowIndex) {
                             normalizedRow[standardHeader] = stringValue;
                         }
                     } else {
-                        normalizedRow[standardHeader] = stringValue;
+                        // CRITICAL FIX: Don't overwrite a valid URL with a non-URL value
+                        // This happens when both "URL" and "Link" columns exist and both map to "URL"
+                        // The "Link" column typically contains "View" or hyperlink formulas
+                        if (standardHeader === 'URL' && normalizedRow.URL && isURL(normalizedRow.URL)) {
+                            // URL already set with a valid URL, don't overwrite with non-URL value
+                            log.info(`  Preserving existing URL in row, not overwriting with: ${stringValue}`);
+                        } else {
+                            normalizedRow[standardHeader] = stringValue;
+                        }
                     }
                 }
             }
