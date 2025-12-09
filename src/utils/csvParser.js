@@ -57,8 +57,10 @@ const STANDARD_HEADERS = [
     'URL',
     'Link',
     'Image_URL',
+    'Image_URL Link',
     'EPC rating',
     'EPC Certificate',
+    'EPC Certificate Link',
     'Google Streetview URL',
     'Google Streetview Link',
     'isTarget',
@@ -87,10 +89,14 @@ const HEADER_VARIATIONS = {
     'Latitude': ['latitude', 'lat'],
     'Longitude': ['longitude', 'lng', 'long'],
     'URL': ['url', 'link', 'web link', 'listing url'],
+    'Link': ['link'],
     'Image_URL': ['image', 'image url', 'photo', 'picture'],
+    'Image_URL Link': ['image_url link', 'image link'],
     'EPC rating': ['epc', 'epc rating', 'energy rating', 'energy performance'],
     'EPC Certificate': ['epc certificate', 'epc cert', 'epc link', 'epc url', 'energy certificate'],
+    'EPC Certificate Link': ['epc certificate link', 'epc cert link'],
     'Google Streetview URL': ['streetview', 'google streetview', 'street view'],
+    'Google Streetview Link': ['google streetview link', 'streetview link'],
     'isTarget': ['istarget', 'is target', 'target'],
     'Ranking': ['ranking', 'rank', 'score'],
     'needs_review': ['needs review', 'review', 'flag', 'needs_review']
@@ -350,7 +356,7 @@ function normalizeData(records, headerMapping, headerRowIndex) {
                     // CRITICAL: Prevent URLs from being mapped to non-URL columns
                     if (isURL(stringValue)) {
                         // If this column is not a URL column, move it to URL column
-                        if (!['URL', 'Link', 'Image_URL', 'EPC Certificate', 'Google Streetview URL'].includes(standardHeader)) {
+                        if (!['URL', 'Link', 'Image_URL', 'Image_URL Link', 'EPC Certificate', 'EPC Certificate Link', 'Google Streetview URL', 'Google Streetview Link'].includes(standardHeader)) {
                             log.warning(`Found URL in non-URL column (${standardHeader}), moving to URL column: ${stringValue}`);
                             normalizedRow.URL = stringValue;
                             normalizedRow.Link = `=HYPERLINK("${stringValue}", "View")`;
