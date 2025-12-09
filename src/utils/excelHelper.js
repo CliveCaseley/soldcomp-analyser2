@@ -33,6 +33,13 @@ function addHyperlinks(properties) {
             property.Link = '';
         }
         
+        // Image URL hyperlink
+        if (property.Image_URL) {
+            property['Image_URL Link'] = generateHyperlink(property.Image_URL, 'View Image');
+        } else {
+            property['Image_URL Link'] = '';
+        }
+        
         // ENHANCEMENT B: EPC Certificate hyperlink
         if (property['EPC Certificate']) {
             property['EPC Certificate Link'] = generateHyperlink(property['EPC Certificate'], 'View EPC');
