@@ -422,6 +422,9 @@ function generateEPCSearchURL(postcode) {
  * Uses web scraping to extract certificate numbers directly from postcode search page
  * This is more reliable than the API which often doesn't return certificate-number
  * 
+ * FINAL TASK 2: Enhanced with direct certificate page rating scraping
+ * If rating is not found on postcode search page, scrapes individual certificate page
+ * 
  * @param {string} postcode - Property postcode
  * @param {string} address - Property address
  * @param {string} apiKey - EPC API key (optional, kept for compatibility but not used)
@@ -435,10 +438,21 @@ async function fetchEPCDataViaAPI(postcode, address, apiKey = null) {
         const certData = await getCertificateNumber(postcode, address, apiKey);
         
         if (certData) {
-            log.info(`Found EPC via web scraping: Rating ${certData.rating || 'N/A'}, Certificate #: ${certData.certificateNumber}`);
+            let rating = certData.rating;
+            
+            // FINAL TASK 2: If rating not found on postcode search page, scrape certificate page
+            if (!rating && certData.certificateURL) {
+                log.info(`⚠️ Rating not found on postcode search, attempting to scrape from certificate page...`);
+                rating = await scrapeRatingFromCertificate(certData.certificateURL);
+                if (rating) {
+                    log.info(`✅ Successfully scraped rating from certificate: ${rating}`);
+                }
+            }
+            
+            log.info(`Found EPC via web scraping: Rating ${rating || 'N/A'}, Certificate #: ${certData.certificateNumber}`);
             log.info(`Certificate URL: ${certData.certificateURL}`);
             return {
-                rating: certData.rating,
+                rating: rating,
                 certificateURL: certData.certificateURL,
                 certificateNumber: certData.certificateNumber,
                 floorArea: null // Floor area not available from scraping
@@ -490,6 +504,148 @@ function findBestAddressMatch(results, targetAddress) {
     
     // Only return match if score > 50%
     return bestScore > 0.5 ? bestMatch : results[0];
+}
+
+/**
+ * FINAL TASK 2: Scrape EPC rating from certificate page
+ * Extracts the energy efficiency rating (A-G) from individual EPC certificate pages
+ * 
+ * @param {string} certificateURL - Full URL to EPC certificate page
+ * @returns {Promise<string|null>} Energy rating (A-G) or null if not found
+ */
+async function scrapeRatingFromCertificate(certificateURL) {
+    if (!certificateURL) {
+        return null;
+    }
+    
+    log.info(`Scraping EPC rating from certificate: ${certificateURL}`);
+    
+    try {
+        const response = await axios.get(certificateURL, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            },
+            timeout: 10000
+        });
+        
+        const $ = cheerio.load(response.data);
+        
+        let rating = null;
+        
+        // Method 1: Look for energy rating in SVG title or text elements
+        // The certificate page typically shows the rating in a large graphic
+        $('svg text, .energy-rating-letter, .epc-rating, .rating-letter').each((i, elem) => {
+            const text = $(elem).text().trim().toUpperCase();
+            // Check if it's a single letter A-G
+            if (/^[A-G]$/.test(text)) {
+                rating = text;
+                log.info(`Found EPC rating (SVG/class): ${rating}`);
+                return false; // break
+            }
+        });
+        
+        // Method 2: Look for "Current energy rating" or "Energy rating" in dt/dd pairs
+        if (!rating) {
+            $('dt').each((i, elem) => {
+                const label = $(elem).text().trim().toLowerCase();
+                if (label.includes('current energy rating') || 
+                    label.includes('energy efficiency rating') ||
+                    label === 'energy rating') {
+                    const value = $(elem).next('dd').text().trim().toUpperCase();
+                    // Extract letter from text like "D" or "Band D" or "Rating: D"
+                    const match = value.match(/\b([A-G])\b/);
+                    if (match) {
+                        rating = match[1];
+                        log.info(`Found EPC rating (dt/dd): ${rating}`);
+                        return false; // break
+                    }
+                }
+            });
+        }
+        
+        // Method 3: Look for energy rating in heading tags or strong emphasis
+        if (!rating) {
+            $('h1, h2, h3, h4, h5, h6, strong, b').each((i, elem) => {
+                const text = $(elem).text().trim();
+                // Look for patterns like "Energy rating: D" or "Rating D" or just "D"
+                if (text.toLowerCase().includes('energy rating') || 
+                    text.toLowerCase().includes('current rating')) {
+                    const match = text.toUpperCase().match(/\b([A-G])\b/);
+                    if (match) {
+                        rating = match[1];
+                        log.info(`Found EPC rating (heading): ${rating}`);
+                        return false; // break
+                    }
+                }
+            });
+        }
+        
+        // Method 4: Look for rating in table cells
+        if (!rating) {
+            $('td, th').each((i, elem) => {
+                const cellText = $(elem).text().trim().toUpperCase();
+                // Look for single letter A-G in cells
+                if (/^[A-G]$/.test(cellText)) {
+                    // Check if previous cell or label mentions "rating" or "efficiency"
+                    const prevCell = $(elem).prev();
+                    const prevText = prevCell.text().trim().toLowerCase();
+                    if (prevText.includes('rating') || 
+                        prevText.includes('efficiency') ||
+                        prevText.includes('current')) {
+                        rating = cellText;
+                        log.info(`Found EPC rating (table): ${rating}`);
+                        return false; // break
+                    }
+                }
+            });
+        }
+        
+        // Method 5: Look in the page content for "energy rating is X" pattern
+        if (!rating) {
+            const bodyText = $('body').text();
+            
+            // Pattern 1: "energy rating is X"
+            let ratingMatch = bodyText.match(/energy\s+rating\s+is\s+([A-G])\b/i);
+            if (ratingMatch) {
+                rating = ratingMatch[1].toUpperCase();
+                log.info(`Found EPC rating (energy rating is X): ${rating}`);
+            }
+            
+            // Pattern 2: "Energy efficiency rating: X" or "rating X"
+            if (!rating) {
+                ratingMatch = bodyText.match(/energy\s+efficiency\s+rating[:\s]*([A-G])\b/i);
+                if (ratingMatch) {
+                    rating = ratingMatch[1].toUpperCase();
+                    log.info(`Found EPC rating (energy efficiency rating): ${rating}`);
+                }
+            }
+            
+            // Pattern 3: Look in SVG description text (desc tag)
+            if (!rating) {
+                $('desc').each((i, elem) => {
+                    const descText = $(elem).text();
+                    const match = descText.match(/energy\s+rating\s+is\s+([A-G])\b/i);
+                    if (match) {
+                        rating = match[1].toUpperCase();
+                        log.info(`Found EPC rating (SVG desc): ${rating}`);
+                        return false; // break
+                    }
+                });
+            }
+        }
+        
+        if (rating) {
+            log.info(`✅ Successfully scraped EPC rating: ${rating} from ${certificateURL}`);
+            return rating;
+        } else {
+            log.warning(`⚠️ Could not find EPC rating in certificate page: ${certificateURL}`);
+            return null;
+        }
+        
+    } catch (error) {
+        log.warning(`❌ Failed to scrape EPC rating from certificate: ${error.message}`);
+        return null;
+    }
 }
 
 /**
@@ -587,6 +743,10 @@ async function scrapeFloorAreaFromCertificate(certificateURL) {
 
 /**
  * Try to scrape EPC rating for a property (fallback method)
+ * 
+ * FINAL TASK 2: Enhanced with direct certificate page rating scraping
+ * If rating is not found via search, scrapes individual certificate page
+ * 
  * @param {string} postcode - Property postcode
  * @param {string} address - Property address
  * @param {string} apiKey - EPC API key (optional)
@@ -644,8 +804,17 @@ async function scrapeEPCData(postcode, address, apiKey = null) {
             }
         });
 
-        if (epcRating) {
-            log.info(`Found EPC rating via scraping: ${epcRating}`);
+        // FINAL TASK 2: If rating not found but have certificate URL, scrape from certificate page
+        if (!epcRating && certificateURL) {
+            log.info(`⚠️ Rating not found in search results, attempting to scrape from certificate page...`);
+            epcRating = await scrapeRatingFromCertificate(certificateURL);
+            if (epcRating) {
+                log.info(`✅ Successfully scraped rating from certificate: ${epcRating}`);
+            }
+        }
+
+        if (epcRating || certificateURL) {
+            log.info(`Found EPC data via scraping: Rating ${epcRating || 'N/A'}`);
             
             // ENHANCEMENT D: Scrape floor area from certificate if URL is available
             let floorArea = null;
@@ -723,6 +892,7 @@ module.exports = {
     scrapeCertificateNumbersFromPostcode,
     findBestAddressMatchFromScrapedData,
     scrapeFloorAreaFromCertificate,
+    scrapeRatingFromCertificate,
     extractHouseNumber,
     scoreHouseNumberMatch,
     normalizeTextForMatching
