@@ -80,6 +80,26 @@ Actor.main(async () => {
             log.info(`✅ No EPC Lookup rows found in input (correct)`);
         }
         
+        // Step 4.7: CRITICAL FIX - Capture ALL URLs from isTarget rows BEFORE findTarget
+        // This prevents URL loss when output CSV is used as input (iterative processing)
+        // Multiple rows may have isTarget=1 due to CSV parsing issues, capture all their URLs
+        log.info('=== STEP 3.7: Capturing target URLs before findTarget ===');
+        const targetURLs = [];
+        properties.forEach((prop, index) => {
+            if (prop.isTarget === 1 || prop.isTarget === '1' || prop.isTarget === true) {
+                if (prop.URL && prop.URL.trim() !== '') {
+                    targetURLs.push({
+                        url: prop.URL,
+                        index: index,
+                        address: prop.Address,
+                        postcode: prop.Postcode
+                    });
+                    log.info(`  Captured URL from isTarget row ${index}: ${prop.URL.substring(0, 80)}...`);
+                }
+            }
+        });
+        log.info(`✓ Captured ${targetURLs.length} URLs from isTarget rows`);
+        
         // Step 5: Find target property (CRITICAL)
         log.info('=== STEP 4: Finding target property ===');
         const { target, comparables } = findTarget(properties, preHeaderRows);
@@ -88,7 +108,16 @@ Actor.main(async () => {
         
         // Step 5.1: CRITICAL FIX - Preserve target URL
         // Store original target URL before any processing that might overwrite it
-        const originalTargetURL = target.URL;
+        let originalTargetURL = target.URL;
+        
+        // If target URL is empty/invalid and we captured URLs from isTarget rows, use the first one
+        if ((!originalTargetURL || originalTargetURL.trim() === '' || originalTargetURL === 'View') && targetURLs.length > 0) {
+            log.warning(`⚠️ Target has no valid URL, but found ${targetURLs.length} URLs from isTarget rows`);
+            log.warning(`   Restoring URL from isTarget row: ${targetURLs[0].url}`);
+            originalTargetURL = targetURLs[0].url;
+            target.URL = originalTargetURL;
+        }
+        
         log.info(`💾 Preserving target URL: ${originalTargetURL || 'N/A'}`);
         target._originalURL = originalTargetURL; // Store for protection
         
