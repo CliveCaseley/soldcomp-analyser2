@@ -11,6 +11,9 @@
  * 5. Reports HONEST accuracy metrics
  */
 
+// Load environment variables first!
+require('dotenv').config();
+
 const path = require('path');
 const fs = require('fs');
 const { parseCSV } = require('./src/utils/csvParser');
@@ -28,7 +31,13 @@ async function processFullDataset() {
   console.log('='.repeat(80));
   console.log('FULL DATASET VERIFICATION - HONEST ACCURACY TEST');
   console.log('='.repeat(80));
-  console.log(`\nInput: ${INPUT_FILE}`);
+  
+  // Verify API credentials are loaded
+  console.log('\n🔐 API Credentials:');
+  console.log(`Email: ${process.env.EPC_EMAIL || 'NOT SET'}`);
+  console.log(`API Key: ${process.env.EPC_API_KEY ? process.env.EPC_API_KEY.substring(0, 10) + '...' : 'NOT SET'}\n`);
+  
+  console.log(`Input: ${INPUT_FILE}`);
   console.log(`Baseline: ${BASELINE_FILE}`);
   console.log(`Output: ${OUTPUT_FILE}\n`);
 
