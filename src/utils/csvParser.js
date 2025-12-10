@@ -407,7 +407,30 @@ function normalizePreHeaderRow(row) {
         normalizedRow[header] = '';
     });
     
-    // Iterate through all cells in the row
+    // CRITICAL FIX: First pass - capture EPC Certificate data from the entire row
+    // This ensures we don't lose it when we early-return after finding target indicator
+    for (let i = 0; i < row.length; i++) {
+        const cellValue = row[i];
+        if (!cellValue || cellValue === '') continue;
+        
+        const cellStr = String(cellValue).trim();
+        
+        // Check for EPC Certificate labels and capture the URL from the next cell
+        // Patterns like: "epc certificate for target", "epc cert", "energy certificate"
+        if (/epc\s*(certificate|cert|url|link)?|energy\s*certificate/i.test(cellStr)) {
+            log.info(`  Found EPC label at column ${i}: "${cellStr}"`);
+            // Check if the NEXT cell has a URL
+            if (i + 1 < row.length && row[i + 1]) {
+                const nextCellStr = String(row[i + 1]).trim();
+                if (/^https?:\/\//i.test(nextCellStr) && nextCellStr.includes('energy-certificate')) {
+                    normalizedRow['EPC Certificate'] = nextCellStr;
+                    log.info(`  ✓ Captured EPC Certificate URL from column ${i + 1}: ${nextCellStr}`);
+                }
+            }
+        }
+    }
+    
+    // Second pass - iterate through all cells in the row to find target indicator
     for (let i = 0; i < row.length; i++) {
         const cellValue = row[i];
         if (!cellValue || cellValue === '') continue;
@@ -452,6 +475,7 @@ function normalizePreHeaderRow(row) {
                 // Mark as target
                 normalizedRow.isTarget = 1;
                 
+                // CRITICAL: Don't lose the EPC Certificate we captured earlier!
                 return normalizedRow;
             }
         }
@@ -470,15 +494,32 @@ function normalizePreHeaderRow(row) {
         
         const cellStr = String(cellValue).trim();
         
+        // CRITICAL FIX: Check for EPC Certificate labels and capture the URL from the next cell
+        // Patterns like: "epc certificate for target", "epc cert", "energy certificate"
+        if (/epc\s*(certificate|cert|url|link)?|energy\s*certificate/i.test(cellStr)) {
+            log.info(`  Found EPC label at column ${i}: "${cellStr}"`);
+            // Check if the NEXT cell has a URL
+            if (i + 1 < row.length && row[i + 1]) {
+                const nextCellStr = String(row[i + 1]).trim();
+                if (/^https?:\/\//i.test(nextCellStr) && nextCellStr.includes('energy-certificate')) {
+                    normalizedRow['EPC Certificate'] = nextCellStr;
+                    log.info(`  ✓ Captured EPC Certificate URL from column ${i + 1}: ${nextCellStr}`);
+                }
+            }
+        }
+        
         // Try to detect what type of data this is
         // Postcode pattern
         if (/^[A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2}$/i.test(cellStr)) {
             normalizedRow.Postcode = cellStr.toUpperCase();
         }
-        // URL pattern
+        // URL pattern (but NOT EPC certificates - those are handled above)
         else if (/^https?:\/\//i.test(cellStr)) {
-            normalizedRow.URL = cellStr;
-            normalizedRow.Link = `=HYPERLINK("${cellStr}", "View")`;
+            // Only store as URL if it's NOT an EPC certificate (already captured above)
+            if (!cellStr.includes('energy-certificate')) {
+                normalizedRow.URL = cellStr;
+                normalizedRow.Link = `=HYPERLINK("${cellStr}", "View")`;
+            }
         }
         // Check for "1" in what might be the isTarget column
         else if (cellStr === '1' && i > 15) { // isTarget is typically column 21+
