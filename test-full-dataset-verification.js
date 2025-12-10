@@ -104,27 +104,28 @@ async function processFullDataset() {
         notFoundCount++;
         failedCount++;
         console.log(`❌ Not found: Certificate not found`);
-      } else if (certResult.success) {
-        result.certificate = certResult.certificate;
-        result.status = 'success';
-        successCount++;
-        console.log(`✅ Certificate: ${certResult.certificate}`);
-
-        // Get rating
-        try {
-          const ratingResult = await scrapeRatingFromCertificate(certResult.certificate);
-          if (ratingResult && ratingResult.success) {
-            result.rating = ratingResult.rating;
-            console.log(`   Rating: ${ratingResult.rating}`);
+      } else if (certResult.certificateNumber) {
+        // Certificate found (valid or expired)
+        result.certificate = certResult.certificateNumber;
+        result.rating = certResult.rating;
+        
+        if (certResult.expired) {
+          result.status = 'expired';
+          result.error = 'Certificate expired';
+          expiredCount++;
+          console.log(`⏰ Expired certificate: ${certResult.certificateNumber}`);
+          if (certResult.rating) {
+            console.log(`   Rating: ${certResult.rating}`);
           }
-        } catch (err) {
-          console.log(`   ⚠️ Rating extraction failed: ${err.message}`);
+        } else {
+          result.status = 'success';
+          console.log(`✅ Certificate: ${certResult.certificateNumber}`);
+          if (certResult.rating) {
+            console.log(`   Rating: ${certResult.rating}`);
+          }
         }
-      } else if (certResult.expired) {
-        result.status = 'expired';
-        result.error = 'Certificate expired';
-        expiredCount++;
-        console.log(`⏰ Expired certificate`);
+        
+        successCount++;  // Count as success either way since we found it
       } else {
         result.status = 'not_found';
         result.error = certResult.error || 'Certificate not found';
