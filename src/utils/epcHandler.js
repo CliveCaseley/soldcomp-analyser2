@@ -652,17 +652,53 @@ async function scrapeRatingFromCertificate(certificateURL) {
         
         let rating = null;
         
-        // Method 1: Look for energy rating in SVG title or text elements
-        // The certificate page typically shows the rating in a large graphic
-        $('svg text, .energy-rating-letter, .epc-rating, .rating-letter').each((i, elem) => {
+        // Method 1: Look for the ACTUAL rating in SVG with specific classes or score+letter pattern
+        // EPC certificates show rating as "45 E" (score + letter) with class "rating-current"
+        // NOT the scale labels "A B C D E F G"
+        
+        // First, try to find rating with "rating-current" class (most reliable)
+        $('svg.rating-current, .rating-current').each((i, elem) => {
             const text = $(elem).text().trim().toUpperCase();
-            // Check if it's a single letter A-G
-            if (/^[A-G]$/.test(text)) {
-                rating = text;
-                log.info(`Found EPC rating (SVG/class): ${rating}`);
+            // Extract letter from patterns like "45 E" or just "E"
+            const match = text.match(/\b([A-G])\b/);
+            if (match) {
+                rating = match[1];
+                log.info(`Found EPC rating (rating-current class): ${rating} from "${text}"`);
                 return false; // break
             }
         });
+        
+        // Second, look for score + letter pattern in SVG text (e.g., "45 E")
+        // This catches the actual rating, not the scale
+        if (!rating) {
+            $('svg text').each((i, elem) => {
+                const text = $(elem).text().trim().toUpperCase();
+                // Match number followed by letter (e.g., "45 E", "70 C")
+                const match = text.match(/(\d+)\s+([A-G])\b/);
+                if (match) {
+                    const parent = $(elem).parent();
+                    const parentClass = parent.attr('class') || '';
+                    // Ensure it's the current rating, not potential
+                    if (!parentClass.includes('potential')) {
+                        rating = match[2]; // Extract just the letter
+                        log.info(`Found EPC rating (score+letter pattern): ${rating} from "${text}"`);
+                        return false; // break
+                    }
+                }
+            });
+        }
+        
+        // Third, look for epc-rating-result class (contains just the letter)
+        if (!rating) {
+            $('.epc-rating-result').each((i, elem) => {
+                const text = $(elem).text().trim().toUpperCase();
+                if (/^[A-G]$/.test(text)) {
+                    rating = text;
+                    log.info(`Found EPC rating (epc-rating-result): ${rating}`);
+                    return false; // break
+                }
+            });
+        }
         
         // Method 2: Look for "Current energy rating" or "Energy rating" in dt/dd pairs
         // CRITICAL FIX: Exclude "potential rating" labels to avoid extracting future/potential ratings
