@@ -119,17 +119,25 @@ async function scrapeCertificateNumbersFromPostcode(postcode) {
 
 
 /**
- * Get certificate number by scraping postcode search page
- * Uses web scraping approach to extract certificate numbers from href attributes
+ * REWRITE v4.0: Get certificate number with strict address verification
+ * Uses web scraping + individual certificate verification for accuracy
+ * 
+ * NEW APPROACH:
+ * 1. Scrape certificate numbers from postcode search page
+ * 2. For each certificate, fetch full data from certificate page (including exact address)
+ * 3. Compare certificate address with property address using exact house number matching
+ * 4. Only return match if addresses match exactly
+ * 5. If multiple matches, use floor area (if known) as tie-breaker
  * 
  * @param {string} postcode - Property postcode
  * @param {string} address - Property address for matching
  * @param {string} apiKey - EPC API key (optional, kept for compatibility but not used)
+ * @param {number} knownFloorArea - Optional floor area in sqm for better matching when multiple certificates exist
  * @returns {Promise<Object|null>} Certificate data with number or null
  */
-async function getCertificateNumber(postcode, address, apiKey = null) {
+async function getCertificateNumber(postcode, address, apiKey = null, knownFloorArea = null) {
     log.info('═'.repeat(80));
-    log.info('🔎 EPC CERTIFICATE LOOKUP');
+    log.info('🔎 EPC CERTIFICATE LOOKUP v4.0 (STRICT VERIFICATION)');
     log.info('═'.repeat(80));
     
     if (!postcode) {
@@ -143,62 +151,243 @@ async function getCertificateNumber(postcode, address, apiKey = null) {
     }
     
     log.info(`📮 Postcode: ${postcode}`);
-    log.info(`🏠 Address: "${address}"`);
-    log.info(`🌐 Looking up certificate number via web scraping...`);
+    log.info(`🏠 Property Address: "${address}"`);
     log.info('');
     
     try {
-        // Scrape certificate numbers from postcode search page
+        // STEP 1: Scrape certificate numbers from postcode search page
         const certificates = await scrapeCertificateNumbersFromPostcode(postcode);
         
         if (certificates.length === 0) {
             log.warning('❌ No certificates found for postcode');
+            log.info('═'.repeat(80));
             return null;
         }
         
-        log.info(`📊 Found ${certificates.length} certificates for postcode ${postcode}`);
+        log.info(`📊 Found ${certificates.length} certificates for postcode`);
         log.info('');
         
-        // Find best matching address using STRICT exact house number matching
-        const matchResult = findBestAddressMatchFromScrapedData(certificates, address);
+        // STEP 2: Extract property house number for matching
+        const propertyHouseNum = extractHouseNumber(address);
+        log.info(`🔢 Property House Number:`);
+        log.info(`   Primary: ${propertyHouseNum.primary || 'NONE'}`);
+        log.info(`   Flat/Suffix: ${propertyHouseNum.flat || 'NONE'}`);
+        log.info('');
         
-        if (matchResult && matchResult.certificate) {
-            const cert = matchResult.certificate;
+        if (!propertyHouseNum.primary) {
+            log.warning('❌ Cannot extract house number from property address');
+            log.info('═'.repeat(80));
+            return null;
+        }
+        
+        // STEP 3: Check each certificate by scraping its page for exact address
+        log.info('🔍 Checking certificates for exact address match...');
+        log.info('');
+        
+        const normalizedPropertyAddr = normalizeTextForMatching(address);
+        const propertyWords = normalizedPropertyAddr.split(/\s+/).filter(w => w.length > 2);
+        
+        const matchingCertificates = []; // Collect ALL matches instead of returning first one
+        
+        for (let i = 0; i < certificates.length; i++) {
+            const cert = certificates[i];
+            log.info(`─`.repeat(80));
+            log.info(`📄 Certificate ${i + 1}/${certificates.length}: ${cert.certificateNumber}`);
+            log.info(`   Search Page Address: "${cert.address}"`);
+            
+            // Scrape full certificate data including exact address
+            const certData = await scrapeCertificateData(cert.href);
+            
+            if (!certData.address) {
+                log.warning(`   ⚠️ Could not extract address from certificate page`);
+                continue;
+            }
+            
+            log.info(`   📮 Certificate Page Address: "${certData.address}"`);
+            
+            // Extract house number from certificate address
+            const certHouseNum = extractHouseNumber(certData.address);
+            log.info(`   🔢 Certificate House#: ${certHouseNum.primary}${certHouseNum.flat || ''}`);
+            
+            // Check for exact house number match
+            const matchResult = isExactHouseNumberMatch(propertyHouseNum, certHouseNum);
+            log.info(`   ${matchResult.isExactMatch ? '✅' : '❌'} House Number: ${matchResult.matchType}`);
+            
+            if (!matchResult.isExactMatch) {
+                log.info(`   ⏭️  Skipping - house number doesn't match`);
+                continue;
+            }
+            
+            // House number matches - verify street name similarity
+            const normalizedCertAddr = normalizeTextForMatching(certData.address);
+            const certWords = normalizedCertAddr.split(/\s+/).filter(w => w.length > 2);
+            const wordMatches = propertyWords.filter(word => certWords.includes(word));
+            const streetSimilarity = propertyWords.length > 0 ? wordMatches.length / propertyWords.length : 0;
+            
+            log.info(`   📍 Street Similarity: ${(streetSimilarity * 100).toFixed(1)}%`);
+            
+            const MIN_STREET_SIMILARITY = 0.3;
+            if (streetSimilarity < MIN_STREET_SIMILARITY) {
+                log.info(`   ⏭️  Skipping - street name too different (need ${(MIN_STREET_SIMILARITY * 100).toFixed(1)}%)`);
+                continue;
+            }
+            
+            // This is a valid match - add to list
+            log.info(`   ✅ VALID MATCH - added to candidates`);
+            matchingCertificates.push({
+                cert: cert,
+                certData: certData,
+                matchResult: matchResult,
+                streetSimilarity: streetSimilarity
+            });
+        }
+        
+        log.info('');
+        log.info(`📊 Found ${matchingCertificates.length} matching certificate(s)`);
+        
+        // If no matches found, return null
+        if (matchingCertificates.length === 0) {
             log.info('');
-            log.info('✅ CERTIFICATE LOOKUP SUCCESS');
-            log.info(`   Certificate: ${cert.certificateNumber}`);
-            log.info(`   Address: "${cert.address}"`);
-            log.info(`   URL: ${cert.href}`);
-            log.info(`   Match Status: ${matchResult.matchStatus}`);
+            log.info('❌ ═══════════════════════════════════════════════════════════════════════════');
+            log.info('❌ NO EXACT MATCH FOUND');
+            log.info('❌ ═══════════════════════════════════════════════════════════════════════════');
+            log.info(`   Checked ${certificates.length} certificates`);
+            log.info(`   Property: "${address}"`);
+            log.info(`   None had exact house number + street match`);
+            log.info('   🚫 Returning NULL - better no data than wrong data');
+            log.info('═'.repeat(80));
+            return null;
+        }
+        
+        // If only one match, return it
+        if (matchingCertificates.length === 1) {
+            const match = matchingCertificates[0];
+            log.info('');
+            log.info('✅ ═══════════════════════════════════════════════════════════════════════════');
+            log.info('✅ SINGLE EXACT MATCH FOUND!');
+            log.info('✅ ═══════════════════════════════════════════════════════════════════════════');
+            log.info(`   Certificate: ${match.cert.certificateNumber}`);
+            log.info(`   Property Address: "${address}"`);
+            log.info(`   Certificate Address: "${match.certData.address}"`);
+            log.info(`   Rating: ${match.certData.rating || 'N/A'}`);
+            log.info(`   Floor Area: ${match.certData.floorArea ? match.certData.floorArea + ' sqm' : 'N/A'}`);
+            log.info(`   Match Type: ${match.matchResult.matchType}`);
+            log.info(`   Street Similarity: ${(match.streetSimilarity * 100).toFixed(1)}%`);
             log.info('═'.repeat(80));
             
             return {
-                certificateNumber: cert.certificateNumber,
-                certificateURL: cert.href,
-                rating: cert.rating,
-                address: cert.address,
-                matchStatus: matchResult.matchStatus,
-                matchDetails: matchResult.matchDetails
+                certificateNumber: match.cert.certificateNumber,
+                certificateURL: match.cert.href,
+                rating: match.certData.rating,
+                floorArea: match.certData.floorArea,
+                address: match.certData.address,
+                matchStatus: 'Exact Match',
+                matchDetails: {
+                    matchType: match.matchResult.matchType,
+                    streetSimilarity: match.streetSimilarity,
+                    certificateAddress: match.certData.address,
+                    propertyAddress: address
+                }
             };
         }
         
-        // CRITICAL FIX v3.0: Strict exact matching - no fallback, better no data than wrong data
-        // If no exact house number match found, return null (property has no matching EPC)
-        log.warning('⚠️ findBestAddressMatchFromScrapedData returned null');
-        log.warning('⚠️ No EPC certificate with exact house number match found');
+        // Multiple matches found - need to pick the best one
+        // Prioritize: 1) floor area match (if known), 2) addresses WITHOUT property names, 3) better street similarity
+        log.info('');
+        log.info('⚠️ ═══════════════════════════════════════════════════════════════════════════');
+        log.info('⚠️  MULTIPLE MATCHES FOUND - Selecting best match');
+        log.info('⚠️ ═══════════════════════════════════════════════════════════════════════════');
+        if (knownFloorArea) {
+            log.info(`   Known Floor Area: ${knownFloorArea} sqm (will use for matching)`);
+        }
+        log.info('');
+        
+        matchingCertificates.forEach((match, idx) => {
+            log.info(`   ${idx + 1}. ${match.cert.certificateNumber}`);
+            log.info(`      Address: "${match.certData.address}"`);
+            log.info(`      Rating: ${match.certData.rating}, Floor Area: ${match.certData.floorArea} sqm`);
+            log.info(`      Street Similarity: ${(match.streetSimilarity * 100).toFixed(1)}%`);
+        });
+        
+        let bestMatch = null;
+        let bestScore = -1;
+        let selectionReason = '';
+        
+        for (const match of matchingCertificates) {
+            let score = match.streetSimilarity; // Base score from street similarity
+            let reasons = [];
+            
+            // PRIORITY 1: If floor area is known, heavily weight exact matches
+            if (knownFloorArea && match.certData.floorArea) {
+                const floorDiff = Math.abs(match.certData.floorArea - knownFloorArea);
+                if (floorDiff === 0) {
+                    score += 10; // Exact floor area match is VERY strong signal
+                    reasons.push('exact floor area match');
+                } else if (floorDiff <= 2) {
+                    score += 5; // Within 2 sqm is also very good
+                    reasons.push('floor area within 2 sqm');
+                } else if (floorDiff <= 5) {
+                    score += 2; // Within 5 sqm is okay
+                    reasons.push('floor area within 5 sqm');
+                }
+            }
+            
+            // PRIORITY 2: Prefer addresses without property names (slightly)
+            const hasPropertyName = match.certData.address.match(/^[a-z\s]+,\s*\d+/i);
+            if (!hasPropertyName) {
+                score += 0.5;
+                reasons.push('no property name');
+            }
+            
+            if (score > bestScore) {
+                bestScore = score;
+                bestMatch = match;
+                selectionReason = reasons.join(', ') || 'best street similarity';
+            }
+        }
+        
+        log.info('');
+        log.info('✅ SELECTED BEST MATCH:');
+        log.info(`   Certificate: ${bestMatch.cert.certificateNumber}`);
+        log.info(`   Address: "${bestMatch.certData.address}"`);
+        log.info(`   Rating: ${bestMatch.certData.rating}`);
+        log.info(`   Floor Area: ${bestMatch.certData.floorArea} sqm`);
+        log.info(`   Selection Reason: ${selectionReason}`);
         log.info('═'.repeat(80));
-        return null;
+        
+        return {
+            certificateNumber: bestMatch.cert.certificateNumber,
+            certificateURL: bestMatch.cert.href,
+            rating: bestMatch.certData.rating,
+            floorArea: bestMatch.certData.floorArea,
+            address: bestMatch.certData.address,
+            matchStatus: matchingCertificates.length > 1 ? 'Multiple Matches' : 'Exact Match',
+            matchDetails: {
+                matchType: bestMatch.matchResult.matchType,
+                streetSimilarity: bestMatch.streetSimilarity,
+                certificateAddress: bestMatch.certData.address,
+                propertyAddress: address,
+                totalMatches: matchingCertificates.length,
+                allMatches: matchingCertificates.map(m => ({
+                    certificateNumber: m.cert.certificateNumber,
+                    address: m.certData.address,
+                    rating: m.certData.rating,
+                    floorArea: m.certData.floorArea
+                }))
+            }
+        };
         
     } catch (error) {
         log.warning(`❌ Failed to get certificate number: ${error.message}`);
         log.error(error.stack);
+        log.info('═'.repeat(80));
         return null;
     }
 }
 
 /**
  * Extract house number from address string
- * Handles various formats: "32", "32a", "32A", "Flat 1, 32", "32-34", etc.
+ * Handles various formats: "32", "32a", "32A", "Flat 1, 32", "32-34", "Spen Lea, 317 Street", etc.
  * @param {string} address - Address string
  * @returns {Object} {primary: string, flat: string|null, hasRange: boolean}
  */
@@ -218,7 +407,29 @@ function extractHouseNumber(address) {
         };
     }
     
-    // Pattern 2: "32a Street" or "32A Street" (house number with letter suffix)
+    // Pattern 2: Property name followed by number, e.g., "Spen Lea, 317 Wharf Road" or "Akland House, 303 Street"
+    // Look for: word(s), comma, number
+    const propertyNamePattern = /^[a-z\s]+,\s*(\d+[a-z]?)\b/i;
+    const propertyNameMatch = normalized.match(propertyNamePattern);
+    if (propertyNameMatch) {
+        const houseNum = propertyNameMatch[1];
+        // Check if it has a letter suffix
+        const letterCheck = houseNum.match(/^(\d+)([a-z])$/i);
+        if (letterCheck) {
+            return {
+                primary: letterCheck[1],
+                flat: letterCheck[2],
+                hasRange: false
+            };
+        }
+        return {
+            primary: houseNum,
+            flat: null,
+            hasRange: false
+        };
+    }
+    
+    // Pattern 3: "32a Street" or "32A Street" (house number with letter suffix at start)
     const letterSuffixPattern = /^(\d+)([a-z])\b/i;
     const letterMatch = normalized.match(letterSuffixPattern);
     if (letterMatch) {
@@ -229,7 +440,7 @@ function extractHouseNumber(address) {
         };
     }
     
-    // Pattern 3: "32-34 Street" (range)
+    // Pattern 4: "32-34 Street" (range)
     const rangePattern = /^(\d+)-(\d+)\b/;
     const rangeMatch = normalized.match(rangePattern);
     if (rangeMatch) {
@@ -241,12 +452,34 @@ function extractHouseNumber(address) {
         };
     }
     
-    // Pattern 4: Simple "32 Street" (just extract leading number)
+    // Pattern 5: Simple "32 Street" (just extract leading number)
     const simplePattern = /^(\d+)\b/;
     const simpleMatch = normalized.match(simplePattern);
     if (simpleMatch) {
         return {
             primary: simpleMatch[1],
+            flat: null,
+            hasRange: false
+        };
+    }
+    
+    // Pattern 6: Number after comma anywhere in address (last resort for addresses like "Name, Name, 32 Street")
+    // Look for comma followed by number
+    const commaNumberPattern = /,\s*(\d+[a-z]?)\b/i;
+    const commaNumberMatch = normalized.match(commaNumberPattern);
+    if (commaNumberMatch) {
+        const houseNum = commaNumberMatch[1];
+        // Check if it has a letter suffix
+        const letterCheck = houseNum.match(/^(\d+)([a-z])$/i);
+        if (letterCheck) {
+            return {
+                primary: letterCheck[1],
+                flat: letterCheck[2],
+                hasRange: false
+            };
+        }
+        return {
+            primary: houseNum,
             flat: null,
             hasRange: false
         };
@@ -535,45 +768,41 @@ function generateEPCSearchURL(postcode) {
 }
 
 /**
- * Fetch EPC data using web scraping (NEW APPROACH - v2.5)
- * Uses web scraping to extract certificate numbers directly from postcode search page
- * This is more reliable than the API which often doesn't return certificate-number
- * 
- * FINAL TASK 2: Enhanced with direct certificate page rating scraping
- * If rating is not found on postcode search page, scrapes individual certificate page
+ * REWRITE v4.0: Fetch EPC data using web scraping with strict verification
+ * Uses the new getCertificateNumber function which includes:
+ * - Strict address verification from certificate page
+ * - Rating extraction from structured HTML
+ * - Floor area extraction from structured HTML
+ * - Floor area matching for tie-breaking when multiple certificates exist
  * 
  * @param {string} postcode - Property postcode
  * @param {string} address - Property address
  * @param {string} apiKey - EPC API key (optional, kept for compatibility but not used)
+ * @param {number} knownFloorArea - Optional known floor area in sqm for better matching
  * @returns {Object} EPC data with certificate URL, rating, floor area
  */
-async function fetchEPCDataViaAPI(postcode, address, apiKey = null) {
-    log.info(`Fetching EPC data via web scraping for: ${address}, ${postcode}`);
+async function fetchEPCDataViaAPI(postcode, address, apiKey = null, knownFloorArea = null) {
+    log.info(`Fetching EPC data via web scraping (v4.0) for: ${address}, ${postcode}`);
+    if (knownFloorArea) {
+        log.info(`  Known floor area: ${knownFloorArea} sqm (will use for matching)`);
+    }
     
     try {
-        // Use web scraping to get certificate data
-        const certData = await getCertificateNumber(postcode, address, apiKey);
+        // Use new approach: getCertificateNumber now includes full certificate verification
+        const certData = await getCertificateNumber(postcode, address, apiKey, knownFloorArea);
         
         if (certData) {
-            let rating = certData.rating;
+            log.info(`Found EPC via web scraping:`);
+            log.info(`  Certificate: ${certData.certificateNumber}`);
+            log.info(`  Rating: ${certData.rating || 'N/A'}`);
+            log.info(`  Floor Area: ${certData.floorArea ? certData.floorArea + ' sqm' : 'N/A'}`);
+            log.info(`  Match Status: ${certData.matchStatus || 'N/A'}`);
             
-            // FINAL TASK 2: If rating not found on postcode search page, scrape certificate page
-            if (!rating && certData.certificateURL) {
-                log.info(`⚠️ Rating not found on postcode search, attempting to scrape from certificate page...`);
-                rating = await scrapeRatingFromCertificate(certData.certificateURL);
-                if (rating) {
-                    log.info(`✅ Successfully scraped rating from certificate: ${rating}`);
-                }
-            }
-            
-            log.info(`Found EPC via web scraping: Rating ${rating || 'N/A'}, Certificate #: ${certData.certificateNumber}`);
-            log.info(`Certificate URL: ${certData.certificateURL}`);
-            log.info(`Match Status: ${certData.matchStatus || 'N/A'}`);
             return {
-                rating: rating,
+                rating: certData.rating,
                 certificateURL: certData.certificateURL,
                 certificateNumber: certData.certificateNumber,
-                floorArea: null, // Floor area not available from scraping
+                floorArea: certData.floorArea, // Now included from certificate page
                 matchStatus: certData.matchStatus,
                 matchDetails: certData.matchDetails
             };
@@ -627,310 +856,140 @@ function findBestAddressMatch(results, targetAddress) {
 }
 
 /**
- * FINAL TASK 2: Scrape EPC rating from certificate page
- * Extracts the energy efficiency rating (A-G) from individual EPC certificate pages
+ * REWRITE v4.0: Scrape EPC data from certificate page using structured HTML
+ * Uses reliable HTML structure: epc-address, epc-rating-result, govuk-summary-list
+ * This is MUCH simpler and more reliable than previous SVG/fallback approaches
+ * 
+ * @param {string} certificateURL - Full URL to EPC certificate page
+ * @returns {Promise<Object>} {address: string, rating: string, floorArea: number} or null values
+ */
+async function scrapeCertificateData(certificateURL) {
+    if (!certificateURL) {
+        log.warning('Cannot scrape certificate: missing URL');
+        return { address: null, rating: null, floorArea: null };
+    }
+    
+    log.info(`🔍 Scraping certificate data from: ${certificateURL}`);
+    
+    try {
+        const response = await axios.get(certificateURL, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            },
+            timeout: 10000
+        });
+        
+        const $ = cheerio.load(response.data);
+        
+        // Extract certificate address from structured HTML
+        let certificateAddress = null;
+        const addressElem = $('.epc-address.govuk-body, p.epc-address');
+        if (addressElem.length > 0) {
+            // Get HTML and replace <br> with commas for parsing
+            const addressHtml = addressElem.html() || '';
+            certificateAddress = addressHtml
+                .replace(/<br\s*\/?>/gi, ', ')
+                .replace(/<[^>]+>/g, '') // Remove any other HTML tags
+                .trim();
+            log.info(`📮 Certificate Address: "${certificateAddress}"`);
+        } else {
+            log.warning('⚠️ Could not find certificate address (.epc-address)');
+        }
+        
+        // Extract rating from structured HTML (plain text, not SVG)
+        let rating = null;
+        const ratingElem = $('.epc-rating-result.govuk-body, p.epc-rating-result');
+        if (ratingElem.length > 0) {
+            const ratingText = ratingElem.text().trim().toUpperCase();
+            // Expect single letter A-G
+            if (/^[A-G]$/.test(ratingText)) {
+                rating = ratingText;
+                log.info(`⭐ Certificate Rating: ${rating}`);
+            } else {
+                log.warning(`⚠️ Found .epc-rating-result but text doesn't match A-G: "${ratingText}"`);
+            }
+        } else {
+            log.warning('⚠️ Could not find rating element (.epc-rating-result)');
+        }
+        
+        // Extract floor area from summary list
+        let floorArea = null;
+        $('dt').each((i, elem) => {
+            const label = $(elem).text().trim().toLowerCase();
+            if (label.includes('total floor area')) {
+                const valueElem = $(elem).next('dd');
+                if (valueElem.length > 0) {
+                    const valueText = valueElem.text().trim();
+                    // Match number before "square metres"
+                    const match = valueText.match(/(\d+(?:\.\d+)?)\s*square metres?/i);
+                    if (match) {
+                        floorArea = parseFloat(match[1]);
+                        log.info(`📐 Floor Area: ${floorArea} square metres`);
+                        return false; // break
+                    }
+                }
+            }
+        });
+        
+        if (!floorArea) {
+            log.warning('⚠️ Could not find floor area in certificate');
+        }
+        
+        return {
+            address: certificateAddress,
+            rating: rating,
+            floorArea: floorArea
+        };
+        
+    } catch (error) {
+        log.error(`❌ Failed to scrape certificate data: ${error.message}`);
+        return { address: null, rating: null, floorArea: null };
+    }
+}
+
+/**
+ * BACKWARD COMPATIBILITY: Scrape EPC rating from certificate page
+ * Now uses the new scrapeCertificateData function
  * 
  * @param {string} certificateURL - Full URL to EPC certificate page
  * @returns {Promise<string|null>} Energy rating (A-G) or null if not found
  */
 async function scrapeRatingFromCertificate(certificateURL) {
-    if (!certificateURL) {
-        return null;
-    }
-    
-    log.info(`Scraping EPC rating from certificate: ${certificateURL}`);
-    
-    try {
-        const response = await axios.get(certificateURL, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            },
-            timeout: 10000
-        });
-        
-        const $ = cheerio.load(response.data);
-        
-        let rating = null;
-        
-        // Method 1: Look for the ACTUAL rating in SVG with specific classes or score+letter pattern
-        // EPC certificates show rating as "45 E" (score + letter) with class "rating-current"
-        // NOT the scale labels "A B C D E F G"
-        
-        // First, try to find rating with "rating-current" class (most reliable)
-        $('svg.rating-current, .rating-current').each((i, elem) => {
-            const text = $(elem).text().trim().toUpperCase();
-            // Extract letter from patterns like "45 E" or just "E"
-            const match = text.match(/\b([A-G])\b/);
-            if (match) {
-                rating = match[1];
-                log.info(`Found EPC rating (rating-current class): ${rating} from "${text}"`);
-                return false; // break
-            }
-        });
-        
-        // Second, look for score + letter pattern in SVG text (e.g., "45 E")
-        // This catches the actual rating, not the scale
-        if (!rating) {
-            $('svg text').each((i, elem) => {
-                const text = $(elem).text().trim().toUpperCase();
-                // Match number followed by letter (e.g., "45 E", "70 C")
-                const match = text.match(/(\d+)\s+([A-G])\b/);
-                if (match) {
-                    const parent = $(elem).parent();
-                    const parentClass = parent.attr('class') || '';
-                    // Ensure it's the current rating, not potential
-                    if (!parentClass.includes('potential')) {
-                        rating = match[2]; // Extract just the letter
-                        log.info(`Found EPC rating (score+letter pattern): ${rating} from "${text}"`);
-                        return false; // break
-                    }
-                }
-            });
-        }
-        
-        // Third, look for epc-rating-result class (contains just the letter)
-        if (!rating) {
-            $('.epc-rating-result').each((i, elem) => {
-                const text = $(elem).text().trim().toUpperCase();
-                if (/^[A-G]$/.test(text)) {
-                    rating = text;
-                    log.info(`Found EPC rating (epc-rating-result): ${rating}`);
-                    return false; // break
-                }
-            });
-        }
-        
-        // Method 2: Look for "Current energy rating" or "Energy rating" in dt/dd pairs
-        // CRITICAL FIX: Exclude "potential rating" labels to avoid extracting future/potential ratings
-        if (!rating) {
-            $('dt').each((i, elem) => {
-                const label = $(elem).text().trim().toLowerCase();
-                
-                // Skip potential ratings or improvement steps
-                if (label.includes('potential') || 
-                    label.includes('after completing') || 
-                    label.includes('step ')) {
-                    return true; // continue to next
-                }
-                
-                if (label.includes('current energy rating') || 
-                    label.includes('energy efficiency rating') ||
-                    label === 'energy rating') {
-                    const value = $(elem).next('dd').text().trim().toUpperCase();
-                    // Extract letter from text like "D" or "Band D" or "Rating: D"
-                    const match = value.match(/\b([A-G])\b/);
-                    if (match) {
-                        rating = match[1];
-                        log.info(`Found EPC rating (dt/dd): ${rating}`);
-                        return false; // break
-                    }
-                }
-            });
-        }
-        
-        // Method 3: Look for energy rating in heading tags or strong emphasis
-        if (!rating) {
-            $('h1, h2, h3, h4, h5, h6, strong, b').each((i, elem) => {
-                const text = $(elem).text().trim();
-                // Look for patterns like "Energy rating: D" or "Rating D" or just "D"
-                if (text.toLowerCase().includes('energy rating') || 
-                    text.toLowerCase().includes('current rating')) {
-                    const match = text.toUpperCase().match(/\b([A-G])\b/);
-                    if (match) {
-                        rating = match[1];
-                        log.info(`Found EPC rating (heading): ${rating}`);
-                        return false; // break
-                    }
-                }
-            });
-        }
-        
-        // Method 4: Look for rating in table cells
-        if (!rating) {
-            $('td, th').each((i, elem) => {
-                const cellText = $(elem).text().trim().toUpperCase();
-                // Look for single letter A-G in cells
-                if (/^[A-G]$/.test(cellText)) {
-                    // Check if previous cell or label mentions "rating" or "efficiency"
-                    const prevCell = $(elem).prev();
-                    const prevText = prevCell.text().trim().toLowerCase();
-                    if (prevText.includes('rating') || 
-                        prevText.includes('efficiency') ||
-                        prevText.includes('current')) {
-                        rating = cellText;
-                        log.info(`Found EPC rating (table): ${rating}`);
-                        return false; // break
-                    }
-                }
-            });
-        }
-        
-        // Method 5: Look in the page content for "energy rating is X" pattern
-        if (!rating) {
-            const bodyText = $('body').text();
-            
-            // Pattern 1: "energy rating is X"
-            let ratingMatch = bodyText.match(/energy\s+rating\s+is\s+([A-G])\b/i);
-            if (ratingMatch) {
-                rating = ratingMatch[1].toUpperCase();
-                log.info(`Found EPC rating (energy rating is X): ${rating}`);
-            }
-            
-            // Pattern 2: "Energy efficiency rating: X" or "rating X"
-            if (!rating) {
-                ratingMatch = bodyText.match(/energy\s+efficiency\s+rating[:\s]*([A-G])\b/i);
-                if (ratingMatch) {
-                    rating = ratingMatch[1].toUpperCase();
-                    log.info(`Found EPC rating (energy efficiency rating): ${rating}`);
-                }
-            }
-            
-            // Pattern 3: Look in SVG description text (desc tag)
-            if (!rating) {
-                $('desc').each((i, elem) => {
-                    const descText = $(elem).text();
-                    const match = descText.match(/energy\s+rating\s+is\s+([A-G])\b/i);
-                    if (match) {
-                        rating = match[1].toUpperCase();
-                        log.info(`Found EPC rating (SVG desc): ${rating}`);
-                        return false; // break
-                    }
-                });
-            }
-        }
-        
-        if (rating) {
-            log.info(`✅ Successfully scraped EPC rating: ${rating} from ${certificateURL}`);
-            return rating;
-        } else {
-            log.warning(`⚠️ Could not find EPC rating in certificate page: ${certificateURL}`);
-            return null;
-        }
-        
-    } catch (error) {
-        log.warning(`❌ Failed to scrape EPC rating from certificate: ${error.message}`);
-        return null;
-    }
+    const data = await scrapeCertificateData(certificateURL);
+    return data.rating;
 }
 
 /**
- * ENHANCEMENT D: Scrape floor area from EPC certificate page
- * Extracts floor area (in sqm) from individual EPC certificate pages
+ * BACKWARD COMPATIBILITY: Scrape floor area from EPC certificate page
+ * Now uses the new scrapeCertificateData function
  * 
  * @param {string} certificateURL - Full URL to EPC certificate page
  * @returns {Promise<number|null>} Floor area in square meters, or null if not found
  */
 async function scrapeFloorAreaFromCertificate(certificateURL) {
-    if (!certificateURL) {
-        return null;
-    }
-    
-    log.info(`Scraping floor area from certificate: ${certificateURL}`);
-    
-    try {
-        const response = await axios.get(certificateURL, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            },
-            timeout: 10000
-        });
-        
-        const $ = cheerio.load(response.data);
-        
-        // Look for floor area in the certificate page
-        // Floor area is typically displayed in various formats:
-        // "Total floor area: 123 m²"
-        // "Total floor area   123 square metres"
-        
-        let floorArea = null;
-        
-        // Method 1: Look for dt/dd pairs with "Total floor area"
-        $('dt').each((i, elem) => {
-            const label = $(elem).text().trim().toLowerCase();
-            if (label.includes('total floor area') || label.includes('floor area')) {
-                const value = $(elem).next('dd').text().trim();
-                const match = value.match(/(\d+(?:\.\d+)?)/);
-                if (match) {
-                    floorArea = parseFloat(match[1]);
-                    log.info(`Found floor area (dt/dd): ${floorArea} sqm`);
-                    return false; // break
-                }
-            }
-        });
-        
-        // Method 2: Look for text containing "floor area" and extract number
-        if (!floorArea) {
-            $('p, div, span, td, th').each((i, elem) => {
-                const text = $(elem).text().trim();
-                if (text.toLowerCase().includes('total floor area') || text.toLowerCase().includes('floor area')) {
-                    const match = text.match(/(\d+(?:\.\d+)?)\s*(?:m²|m2|square\s+metres?|sqm)/i);
-                    if (match) {
-                        floorArea = parseFloat(match[1]);
-                        log.info(`Found floor area (text search): ${floorArea} sqm`);
-                        return false; // break
-                    }
-                }
-            });
-        }
-        
-        // Method 3: Look in table rows for floor area
-        if (!floorArea) {
-            $('tr').each((i, elem) => {
-                const rowText = $(elem).text().trim().toLowerCase();
-                if (rowText.includes('floor area')) {
-                    const cells = $(elem).find('td');
-                    if (cells.length > 1) {
-                        const value = cells.last().text().trim();
-                        const match = value.match(/(\d+(?:\.\d+)?)/);
-                        if (match) {
-                            floorArea = parseFloat(match[1]);
-                            log.info(`Found floor area (table): ${floorArea} sqm`);
-                            return false; // break
-                        }
-                    }
-                }
-            });
-        }
-        
-        if (floorArea && floorArea > 0) {
-            log.info(`Successfully scraped floor area: ${floorArea} sqm from ${certificateURL}`);
-            return floorArea;
-        } else {
-            log.warning(`Could not find floor area in certificate page: ${certificateURL}`);
-            return null;
-        }
-        
-    } catch (error) {
-        log.warning(`Failed to scrape floor area from certificate: ${error.message}`);
-        return null;
-    }
+    const data = await scrapeCertificateData(certificateURL);
+    return data.floorArea;
 }
 
 /**
  * Try to scrape EPC rating for a property (fallback method)
  * 
- * FINAL TASK 2: Enhanced with direct certificate page rating scraping
- * If rating is not found via search, scrapes individual certificate page
+ * REWRITE v4.0: Enhanced with structured HTML parsing and floor area matching
  * 
  * @param {string} postcode - Property postcode
  * @param {string} address - Property address
  * @param {string} apiKey - EPC API key (optional)
+ * @param {number} knownFloorArea - Optional known floor area in sqm for better matching
  * @returns {Object} EPC data or null
  */
-async function scrapeEPCData(postcode, address, apiKey = null) {
+async function scrapeEPCData(postcode, address, apiKey = null, knownFloorArea = null) {
     log.info(`Attempting to fetch EPC data for: ${address}, ${postcode}`);
     
-    // Try API first if key available
+    // Try API first if key available (API mode uses fetchEPCDataViaAPI which includes full scraping)
     if (apiKey) {
-        const apiData = await fetchEPCDataViaAPI(postcode, address, apiKey);
+        const apiData = await fetchEPCDataViaAPI(postcode, address, apiKey, knownFloorArea);
         if (apiData) {
-            // ENHANCEMENT D: Scrape floor area from certificate if URL is available
-            if (apiData.certificateURL && !apiData.floorArea) {
-                const scrapedFloorArea = await scrapeFloorAreaFromCertificate(apiData.certificateURL);
-                if (scrapedFloorArea) {
-                    apiData.floorArea = scrapedFloorArea;
-                }
-            }
+            // Floor area is now extracted during certificate verification
             return apiData;
         }
     }
@@ -1058,6 +1117,8 @@ module.exports = {
     findBestAddressMatchFromScrapedData,
     scrapeFloorAreaFromCertificate,
     scrapeRatingFromCertificate,
+    scrapeCertificateData,
+    fetchEPCDataViaAPI,
     extractHouseNumber,
     isExactHouseNumberMatch,
     normalizeTextForMatching
