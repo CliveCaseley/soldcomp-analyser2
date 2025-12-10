@@ -88,8 +88,9 @@ async function scrapeCertificateTable(postcode) {
                 const certificateNumber = match[1];
                 
                 if (isValidCertificateNumber(certificateNumber)) {
-                    // Find rating in the same row (typically in a govuk-tag)
+                    // Find rating and expiry status in the same row
                     let rating = null;
+                    let expired = false;
                     const row = $(elem).closest('tr, .govuk-summary-list__row, .search-result');
                     if (row.length > 0) {
                         // Look for rating tag in the row
@@ -101,15 +102,26 @@ async function scrapeCertificateTable(postcode) {
                         if (ratingElem.length > 0) {
                             rating = ratingElem.text().trim().toUpperCase();
                         }
+                        
+                        // Check for expired tag: <strong class="govuk-tag govuk-tag--red">Expired</strong>
+                        const expiredTag = row.find('.govuk-tag--red, .govuk-tag').filter(function() {
+                            const text = $(this).text().trim();
+                            return text.toLowerCase() === 'expired';
+                        });
+                        
+                        if (expiredTag.length > 0) {
+                            expired = true;
+                        }
                     }
                     
                     certificates.push({
                         certificateNumber: certificateNumber,
                         address: address,
-                        rating: rating
+                        rating: rating,
+                        expired: expired
                     });
                     
-                    log.info(`   Found: ${certificateNumber} | ${address} | Rating: ${rating || 'N/A'}`);
+                    log.info(`   Found: ${certificateNumber} | ${address} | Rating: ${rating || 'N/A'} | ${expired ? '🔴 EXPIRED' : '✅ Valid'}`);
                 }
             }
         });
@@ -201,17 +213,36 @@ function matchAddressToCertificateRow(certificates, propertyAddress) {
     }
     
     if (matches.length === 1) {
-        log.info(`✅ Found exact match: ${matches[0].cert.certificateNumber}`);
-        return matches[0].cert;
+        const match = matches[0];
+        const expiredStatus = match.cert.expired ? '🔴 EXPIRED' : '✅ Valid';
+        log.info(`✅ Found exact match: ${match.cert.certificateNumber} (${expiredStatus})`);
+        return match.cert;
     }
     
-    // Multiple matches - pick best one by street similarity
-    log.info(`⚠️ Multiple matches found (${matches.length}), selecting best by street similarity...`);
-    const bestMatch = matches.reduce((best, current) => 
+    // Multiple matches - prefer non-expired certificates
+    log.info(`⚠️ Multiple matches found (${matches.length}), selecting best certificate...`);
+    
+    // Separate expired and non-expired matches
+    const nonExpiredMatches = matches.filter(m => !m.cert.expired);
+    const expiredMatches = matches.filter(m => m.cert.expired);
+    
+    log.info(`   Non-expired: ${nonExpiredMatches.length}, Expired: ${expiredMatches.length}`);
+    
+    // Prefer non-expired certificates, otherwise use expired ones
+    const candidateMatches = nonExpiredMatches.length > 0 ? nonExpiredMatches : expiredMatches;
+    
+    // Pick best one by street similarity from the candidate pool
+    const bestMatch = candidateMatches.reduce((best, current) => 
         current.streetSimilarity > best.streetSimilarity ? current : best
     );
     
-    log.info(`✅ Selected best match: ${bestMatch.cert.certificateNumber} (${(bestMatch.streetSimilarity * 100).toFixed(1)}% similarity)`);
+    const expiredStatus = bestMatch.cert.expired ? '🔴 EXPIRED' : '✅ Valid';
+    log.info(`✅ Selected best match: ${bestMatch.cert.certificateNumber} (${(bestMatch.streetSimilarity * 100).toFixed(1)}% similarity, ${expiredStatus})`);
+    
+    if (bestMatch.cert.expired && nonExpiredMatches.length === 0) {
+        log.warning(`⚠️ All matching certificates are expired - using most similar expired certificate`);
+    }
+    
     return bestMatch.cert;
 }
 
@@ -308,6 +339,7 @@ async function getCertificateNumber(postcode, address, apiKey = null, knownFloor
         log.info(`   Certificate Address: "${certData.address || matchedCert.address}"`);
         log.info(`   Rating: ${finalRating || 'N/A'}`);
         log.info(`   Floor Area: ${certData.floorArea ? certData.floorArea + ' sqm' : 'N/A'}`);
+        log.info(`   Property Type: ${certData.propertyType || 'N/A'}`);
         log.info(`   Address Verified: ${addressVerified ? 'YES' : 'NO'}`);
         log.info('═'.repeat(80));
         
@@ -316,6 +348,7 @@ async function getCertificateNumber(postcode, address, apiKey = null, knownFloor
             certificateURL: certificateURL,
             rating: finalRating,
             floorArea: certData.floorArea,
+            propertyType: certData.propertyType,
             address: certData.address || matchedCert.address,
             matchStatus: 'Exact Match',
             addressVerified: addressVerified
@@ -856,10 +889,13 @@ async function scrapeCertificateData(certificateURL) {
             log.warning('⚠️ Could not find rating element (.epc-rating-result)');
         }
         
-        // Extract floor area from summary list
+        // Extract floor area and property type from summary list
         let floorArea = null;
+        let propertyType = null;
         $('dt').each((i, elem) => {
             const label = $(elem).text().trim().toLowerCase();
+            
+            // Extract floor area
             if (label.includes('total floor area')) {
                 const valueElem = $(elem).next('dd');
                 if (valueElem.length > 0) {
@@ -869,8 +905,16 @@ async function scrapeCertificateData(certificateURL) {
                     if (match) {
                         floorArea = parseFloat(match[1]);
                         log.info(`📐 Floor Area: ${floorArea} square metres`);
-                        return false; // break
                     }
+                }
+            }
+            
+            // Extract property type (e.g., "Detached house", "Semi-detached house", "Flat", etc.)
+            if (label.includes('property type') || label.includes('dwelling type')) {
+                const valueElem = $(elem).next('dd');
+                if (valueElem.length > 0) {
+                    propertyType = valueElem.text().trim();
+                    log.info(`🏠 Property Type: ${propertyType}`);
                 }
             }
         });
@@ -879,15 +923,20 @@ async function scrapeCertificateData(certificateURL) {
             log.warning('⚠️ Could not find floor area in certificate');
         }
         
+        if (!propertyType) {
+            log.warning('⚠️ Could not find property type in certificate');
+        }
+        
         return {
             address: certificateAddress,
             rating: rating,
-            floorArea: floorArea
+            floorArea: floorArea,
+            propertyType: propertyType
         };
         
     } catch (error) {
         log.error(`❌ Failed to scrape certificate data: ${error.message}`);
-        return { address: null, rating: null, floorArea: null };
+        return { address: null, rating: null, floorArea: null, propertyType: null };
     }
 }
 
