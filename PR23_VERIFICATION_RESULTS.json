@@ -1,0 +1,40 @@
+{
+  "timestamp": "2025-12-10T13:33:24.489Z",
+  "results": [
+    {
+      "testCase": "51a Outgate",
+      "passed": true,
+      "expectedCert": "9727-0009-2305-7219-1214",
+      "actualCert": "9727-0009-2305-7219-1214",
+      "certMatch": true,
+      "expectedRating": "B",
+      "actualRating": "B",
+      "ratingMatch": true
+    },
+    {
+      "testCase": "317 Wharf Road",
+      "passed": false,
+      "expectedCert": "0310-2606-8090-2399-6161",
+      "actualCert": "2068-4069-6258-6561-6084",
+      "certMatch": false,
+      "expectedRating": "E",
+      "actualRating": "F",
+      "ratingMatch": false
+    },
+    {
+      "testCase": "307 Wharf Road",
+      "passed": true,
+      "expectedCert": null,
+      "actualCert": null,
+      "certMatch": true,
+      "expectedRating": null,
+      "actualRating": null,
+      "ratingMatch": true
+    }
+  ],
+  "summary": {
+    "passed": 2,
+    "total": 3,
+    "successRate": "66.7%"
+  }
+}
