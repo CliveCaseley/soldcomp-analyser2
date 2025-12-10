@@ -266,10 +266,29 @@ async function scrapeAllURLs(classifiedURLs) {
     }
     
     // Scrape PropertyData URLs
+    // CRITICAL FIX: Preserve manual floor area data during PropertyData scraping
     for (const { url, property } of classifiedURLs[URL_TYPES.PROPERTYDATA]) {
         log.info(`Scraping PropertyData: ${url}`);
         const data = await scrapePropertyData(url);
-        scrapedProperties.push({ ...property, ...data, URL: url });
+        
+        // Check if existing property has manual floor area data
+        const hasManualFloorArea = property['Sq. ft'] && property['Sq. ft'] !== '';
+        
+        if (hasManualFloorArea) {
+            log.info(`  ✓ Preserving manual floor area data: ${property['Sq. ft']} sq ft`);
+            // Merge scraped data but preserve existing floor area fields
+            const mergedData = { 
+                ...property, 
+                ...data, 
+                'Sq. ft': property['Sq. ft'],  // Preserve manual Sq. ft
+                'Sqm': property.Sqm,             // Preserve manual Sqm
+                URL: url 
+            };
+            scrapedProperties.push(mergedData);
+        } else {
+            // No manual floor area, use scraped data as-is
+            scrapedProperties.push({ ...property, ...data, URL: url });
+        }
     }
     
     return scrapedProperties;
