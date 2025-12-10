@@ -178,20 +178,12 @@ async function getCertificateNumber(postcode, address, apiKey = null) {
             };
         }
         
-        // If no good match, return first result as fallback
+        // CRITICAL FIX: No fallback to prevent incorrect matches
+        // If no good match found, return null (property has no EPC)
         log.warning('⚠️ findBestAddressMatchFromScrapedData returned null');
-        log.warning('⚠️ Falling back to first certificate');
-        const fallback = certificates[0];
-        log.info(`   Fallback Certificate: ${fallback.certificateNumber}`);
-        log.info(`   Fallback Address: "${fallback.address}"`);
+        log.warning('⚠️ No EPC certificate found for this property');
         log.info('═'.repeat(80));
-        
-        return {
-            certificateNumber: fallback.certificateNumber,
-            certificateURL: fallback.href,
-            rating: fallback.rating,
-            address: fallback.address
-        };
+        return null;
         
     } catch (error) {
         log.warning(`❌ Failed to get certificate number: ${error.message}`);
@@ -261,6 +253,7 @@ function extractHouseNumber(address) {
 
 /**
  * Calculate match score between two house number objects
+ * CRITICAL FIX: Stricter matching to prevent incorrect matches (e.g., 307 to 303)
  * @param {Object} target - Target house number object
  * @param {Object} candidate - Candidate house number object
  * @returns {number} Score between 0 and 1
@@ -293,7 +286,10 @@ function scoreHouseNumberMatch(target, candidate) {
         }
     }
     
-    return 0; // No match
+    // CRITICAL FIX: No partial credit for different house numbers
+    // Previously, similar street names could give a match even with wrong house number
+    // This caused 307 to match with 303 incorrectly
+    return 0; // No match if house numbers don't match exactly
 }
 
 /**
@@ -391,19 +387,21 @@ function findBestAddressMatchFromScrapedData(certificates, targetAddress) {
         });
     log.info('');
     
-    // CRITICAL FIX: Lower threshold from 0.4 to 0.3 for better matching
-    // This helps in cases where street names have slight variations
-    const SCORE_THRESHOLD = 0.3;
+    // CRITICAL FIX: Require minimum score of 0.5 to ensure house number matches
+    // This prevents incorrect matches like 307 matching to 303
+    // Since house number match is weighted 70%, exact match gives 0.7 minimum
+    const SCORE_THRESHOLD = 0.5;
     
-    if (bestScore > SCORE_THRESHOLD && bestMatch) {
+    if (bestScore >= SCORE_THRESHOLD && bestMatch) {
         log.info(`✅ Selected best match: "${bestMatch.address}"`);
         log.info(`   Certificate: ${bestMatch.certificateNumber}`);
         log.info(`   Final Score: ${bestScore.toFixed(3)}`);
         return bestMatch;
     } else {
         log.warning(`❌ No good match found (best score: ${bestScore.toFixed(3)}, threshold: ${SCORE_THRESHOLD})`);
-        log.warning(`⚠️ Falling back to first certificate: "${certificates[0].address}"`);
-        return certificates[0];
+        log.warning(`⚠️ This usually means the property doesn't have an EPC certificate`);
+        log.warning(`⚠️ Returning null instead of fallback to prevent incorrect matches`);
+        return null;
     }
 }
 
@@ -545,9 +543,18 @@ async function scrapeRatingFromCertificate(certificateURL) {
         });
         
         // Method 2: Look for "Current energy rating" or "Energy rating" in dt/dd pairs
+        // CRITICAL FIX: Exclude "potential rating" labels to avoid extracting future/potential ratings
         if (!rating) {
             $('dt').each((i, elem) => {
                 const label = $(elem).text().trim().toLowerCase();
+                
+                // Skip potential ratings or improvement steps
+                if (label.includes('potential') || 
+                    label.includes('after completing') || 
+                    label.includes('step ')) {
+                    return true; // continue to next
+                }
+                
                 if (label.includes('current energy rating') || 
                     label.includes('energy efficiency rating') ||
                     label === 'energy rating') {
