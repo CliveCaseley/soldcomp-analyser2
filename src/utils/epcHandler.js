@@ -159,29 +159,33 @@ async function getCertificateNumber(postcode, address, apiKey = null) {
         log.info(`📊 Found ${certificates.length} certificates for postcode ${postcode}`);
         log.info('');
         
-        // Find best matching address
-        const bestMatch = findBestAddressMatchFromScrapedData(certificates, address);
+        // Find best matching address using STRICT exact house number matching
+        const matchResult = findBestAddressMatchFromScrapedData(certificates, address);
         
-        if (bestMatch) {
+        if (matchResult && matchResult.certificate) {
+            const cert = matchResult.certificate;
             log.info('');
             log.info('✅ CERTIFICATE LOOKUP SUCCESS');
-            log.info(`   Certificate: ${bestMatch.certificateNumber}`);
-            log.info(`   Address: "${bestMatch.address}"`);
-            log.info(`   URL: ${bestMatch.href}`);
+            log.info(`   Certificate: ${cert.certificateNumber}`);
+            log.info(`   Address: "${cert.address}"`);
+            log.info(`   URL: ${cert.href}`);
+            log.info(`   Match Status: ${matchResult.matchStatus}`);
             log.info('═'.repeat(80));
             
             return {
-                certificateNumber: bestMatch.certificateNumber,
-                certificateURL: bestMatch.href,
-                rating: bestMatch.rating,
-                address: bestMatch.address
+                certificateNumber: cert.certificateNumber,
+                certificateURL: cert.href,
+                rating: cert.rating,
+                address: cert.address,
+                matchStatus: matchResult.matchStatus,
+                matchDetails: matchResult.matchDetails
             };
         }
         
-        // CRITICAL FIX: No fallback to prevent incorrect matches
-        // If no good match found, return null (property has no EPC)
+        // CRITICAL FIX v3.0: Strict exact matching - no fallback, better no data than wrong data
+        // If no exact house number match found, return null (property has no matching EPC)
         log.warning('⚠️ findBestAddressMatchFromScrapedData returned null');
-        log.warning('⚠️ No EPC certificate found for this property');
+        log.warning('⚠️ No EPC certificate with exact house number match found');
         log.info('═'.repeat(80));
         return null;
         
@@ -252,44 +256,47 @@ function extractHouseNumber(address) {
 }
 
 /**
- * Calculate match score between two house number objects
- * CRITICAL FIX: Stricter matching to prevent incorrect matches (e.g., 307 to 303)
+ * Check if two house number objects match EXACTLY
+ * CRITICAL FIX v3.0: STRICT exact matching only - NO fuzzy matching, NO partial matches
+ * Better to have NO EPC data than WRONG EPC data
+ * 
  * @param {Object} target - Target house number object
  * @param {Object} candidate - Candidate house number object
- * @returns {number} Score between 0 and 1
+ * @returns {Object} {isExactMatch: boolean, matchType: string}
  */
-function scoreHouseNumberMatch(target, candidate) {
+function isExactHouseNumberMatch(target, candidate) {
     if (!target.primary || !candidate.primary) {
-        return 0;
+        return { isExactMatch: false, matchType: 'missing_house_number' };
     }
     
-    // Exact match on primary number
-    if (target.primary === candidate.primary) {
-        // Check flat/letter suffix match
-        if (target.flat && candidate.flat) {
-            return target.flat === candidate.flat ? 1.0 : 0.7; // Same number, different flat
-        }
-        if (!target.flat && !candidate.flat) {
-            return 1.0; // Perfect match
-        }
-        // One has flat, other doesn't - partial match
-        return 0.8;
+    // RULE 1: Primary house numbers MUST match exactly
+    if (target.primary !== candidate.primary) {
+        return { isExactMatch: false, matchType: 'different_house_number' };
     }
     
-    // Check if target is in candidate's range
-    if (candidate.hasRange && candidate.rangeTo) {
-        const targetNum = parseInt(target.primary, 10);
-        const rangeStart = parseInt(candidate.primary, 10);
-        const rangeEnd = parseInt(candidate.rangeTo, 10);
-        if (targetNum >= rangeStart && targetNum <= rangeEnd) {
-            return 0.6; // Partial match for range
+    // RULE 2: If target has flat/letter suffix, candidate must have the SAME suffix
+    if (target.flat && candidate.flat) {
+        if (target.flat === candidate.flat) {
+            return { isExactMatch: true, matchType: 'exact_with_flat' };
+        } else {
+            return { isExactMatch: false, matchType: 'different_flat' };
         }
     }
     
-    // CRITICAL FIX: No partial credit for different house numbers
-    // Previously, similar street names could give a match even with wrong house number
-    // This caused 307 to match with 303 incorrectly
-    return 0; // No match if house numbers don't match exactly
+    // RULE 3: If target has no flat, but candidate does - this could be ambiguous
+    // Example: Target "32 Street" could match "32a Street" or "32b Street"
+    // For safety, we mark this as ambiguous but allow it (treat whole building as match)
+    if (!target.flat && candidate.flat) {
+        return { isExactMatch: true, matchType: 'target_whole_building' };
+    }
+    
+    // RULE 4: If candidate has no flat, target shouldn't have one either
+    if (target.flat && !candidate.flat) {
+        return { isExactMatch: false, matchType: 'target_has_flat_certificate_doesnt' };
+    }
+    
+    // Perfect match - same primary number, no flats
+    return { isExactMatch: true, matchType: 'exact_match' };
 }
 
 /**
@@ -308,11 +315,17 @@ function normalizeTextForMatching(text) {
 
 /**
  * Find best matching address from scraped certificate data
- * IMPROVED VERSION (v2.6): Enhanced punctuation handling and logging
+ * VERSION 3.0: STRICT EXACT HOUSE NUMBER MATCHING ONLY
+ * 
+ * CRITICAL CHANGE: No fuzzy matching, no partial matches, no scoring thresholds
+ * - First filter to certificates with EXACT house number match
+ * - If no exact matches found, return null (better no data than wrong data)
+ * - Among exact matches, use street name similarity to pick the best one
+ * - Returns object with certificate AND match status for transparency
  * 
  * @param {Array} certificates - Array of certificate objects from scraping
  * @param {string} targetAddress - Target address to match
- * @returns {Object} Best matching certificate or null
+ * @returns {Object|null} {certificate: Object, matchStatus: string, matchDetails: Object} or null
  */
 function findBestAddressMatchFromScrapedData(certificates, targetAddress) {
     // DEFENSIVE: Check for empty certificates array
@@ -323,86 +336,192 @@ function findBestAddressMatchFromScrapedData(certificates, targetAddress) {
     
     // DEFENSIVE: Check for missing target address
     if (!targetAddress || targetAddress.trim() === '') {
-        log.warning('⚠️ No target address provided, returning first certificate as fallback');
-        return certificates[0];
+        log.warning('⚠️ No target address provided - cannot match without address');
+        return null;
     }
     
-    log.info(`🔍 Matching target address: "${targetAddress}"`);
-    log.info(`📋 Total certificates to compare: ${certificates.length}`);
+    log.info('═'.repeat(80));
+    log.info('🔍 STRICT EXACT HOUSE NUMBER MATCHING (v3.0)');
+    log.info('═'.repeat(80));
+    log.info(`🏠 Target address: "${targetAddress}"`);
+    log.info(`📋 Total certificates available: ${certificates.length}`);
+    log.info('');
     
     const normalizedTarget = normalizeTextForMatching(targetAddress);
     const targetHouseNum = extractHouseNumber(targetAddress);
     
-    log.info(`🏠 Extracted target house number: ${JSON.stringify(targetHouseNum)}`);
-    log.info(`📝 Normalized target: "${normalizedTarget}"`);
+    log.info(`🔢 Extracted target house number:`);
+    log.info(`   Primary: ${targetHouseNum.primary || 'NONE'}`);
+    log.info(`   Flat/Suffix: ${targetHouseNum.flat || 'NONE'}`);
+    log.info(`   Has Range: ${targetHouseNum.hasRange}`);
+    log.info('');
     
-    let bestMatch = null;
-    let bestScore = 0;
-    let matchesWithScores = [];
+    // STEP 1: Filter to certificates with EXACT house number match
+    log.info('📌 STEP 1: Filtering for EXACT house number matches...');
+    const exactMatches = [];
     
     for (const cert of certificates) {
         const certAddress = cert.address;
-        const normalizedCertAddr = normalizeTextForMatching(certAddress);
         const certHouseNum = extractHouseNumber(certAddress);
+        const matchResult = isExactHouseNumberMatch(targetHouseNum, certHouseNum);
         
-        // Calculate house number match score (weight: 70%)
-        const houseNumScore = scoreHouseNumberMatch(targetHouseNum, certHouseNum);
+        log.info(`  🔍 "${certAddress.substring(0, 50)}..."`);
+        log.info(`     Cert House#: ${certHouseNum.primary}${certHouseNum.flat || ''}`);
+        log.info(`     Match Result: ${matchResult.isExactMatch ? '✅' : '❌'} (${matchResult.matchType})`);
         
-        // Calculate street name match score (weight: 30%)
-        // Improved: use normalized text (punctuation removed) and filter short words
+        if (matchResult.isExactMatch) {
+            exactMatches.push({
+                cert: cert,
+                certHouseNum: certHouseNum,
+                matchType: matchResult.matchType,
+                certAddress: certAddress
+            });
+        }
+    }
+    
+    log.info('');
+    log.info(`📊 EXACT MATCHES FOUND: ${exactMatches.length}`);
+    log.info('');
+    
+    // STEP 2: If no exact matches, return null
+    if (exactMatches.length === 0) {
+        log.warning('❌ NO EXACT HOUSE NUMBER MATCHES FOUND');
+        log.warning('🚫 Returning NULL - better to have no EPC data than wrong EPC data');
+        log.info('═'.repeat(80));
+        return null;
+    }
+    
+    // STEP 3: If only one exact match, verify street similarity before accepting
+    if (exactMatches.length === 1) {
+        const match = exactMatches[0];
+        
+        // Calculate street similarity for the single match
+        const normalizedCertAddr = normalizeTextForMatching(match.certAddress);
         const targetWords = normalizedTarget.split(/\s+/).filter(w => w.length > 2);
         const certWords = normalizedCertAddr.split(/\s+/).filter(w => w.length > 2);
         const wordMatches = targetWords.filter(word => certWords.includes(word));
         const streetScore = targetWords.length > 0 ? wordMatches.length / targetWords.length : 0;
         
-        // Combined score: prioritize house number matching (70/30 split)
-        const totalScore = (houseNumScore * 0.7) + (streetScore * 0.3);
+        const MIN_STREET_SIMILARITY = 0.3; // At least 30% of words must match
         
-        // Store for debugging
-        matchesWithScores.push({
-            cert: cert,
-            houseNum: certHouseNum.primary,
-            totalScore: totalScore,
-            houseNumScore: houseNumScore,
-            streetScore: streetScore
-        });
+        if (streetScore < MIN_STREET_SIMILARITY) {
+            log.warning('❌ SINGLE MATCH BUT STREET NAME MISMATCH');
+            log.warning(`   Street similarity: ${(streetScore * 100).toFixed(1)}%`);
+            log.warning(`   Minimum required: ${(MIN_STREET_SIMILARITY * 100).toFixed(1)}%`);
+            log.warning(`   House number matches but streets are different: "${targetAddress}" vs "${match.certAddress}"`);
+            log.warning('🚫 Returning NULL - likely different properties with same house number');
+            log.info('═'.repeat(80));
+            return null;
+        }
         
-        log.info(`  📍 Candidate: "${cert.address}"`);
-        log.info(`     House#: ${certHouseNum.primary}${certHouseNum.flat || ''}, Total: ${totalScore.toFixed(3)}, House: ${houseNumScore.toFixed(3)}, Street: ${streetScore.toFixed(3)}`);
+        log.info('✅ SINGLE EXACT MATCH - Using this certificate');
+        log.info(`   Address: "${match.certAddress}"`);
+        log.info(`   Certificate: ${match.cert.certificateNumber}`);
+        log.info(`   Match Type: ${match.matchType}`);
+        log.info(`   Street similarity: ${(streetScore * 100).toFixed(1)}%`);
+        log.info('═'.repeat(80));
         
-        if (totalScore > bestScore) {
-            bestScore = totalScore;
-            bestMatch = cert;
+        return {
+            certificate: match.cert,
+            matchStatus: 'Exact Match',
+            matchDetails: {
+                matchType: match.matchType,
+                candidateCount: certificates.length,
+                exactMatchCount: 1,
+                streetSimilarity: streetScore
+            }
+        };
+    }
+    
+    // STEP 4: Multiple exact matches - use street name similarity to pick best one
+    log.info('⚠️ MULTIPLE EXACT MATCHES - Comparing street names...');
+    log.info('');
+    
+    const targetWords = normalizedTarget.split(/\s+/).filter(w => w.length > 2);
+    let bestMatch = null;
+    let bestStreetScore = 0;
+    
+    for (const match of exactMatches) {
+        const normalizedCertAddr = normalizeTextForMatching(match.certAddress);
+        const certWords = normalizedCertAddr.split(/\s+/).filter(w => w.length > 2);
+        const wordMatches = targetWords.filter(word => certWords.includes(word));
+        const streetScore = targetWords.length > 0 ? wordMatches.length / targetWords.length : 0;
+        
+        log.info(`  📍 "${match.certAddress}"`);
+        log.info(`     Street similarity: ${(streetScore * 100).toFixed(1)}%`);
+        
+        if (streetScore > bestStreetScore) {
+            bestStreetScore = streetScore;
+            bestMatch = match;
         }
     }
     
-    // Log top 5 matches for debugging
-    log.info('');
-    log.info('🏆 Top 5 Matches:');
-    matchesWithScores
-        .sort((a, b) => b.totalScore - a.totalScore)
-        .slice(0, 5)
-        .forEach((m, idx) => {
-            log.info(`  ${idx + 1}. House ${m.houseNum} - Score: ${m.totalScore.toFixed(3)} (house: ${m.houseNumScore.toFixed(3)}, street: ${m.streetScore.toFixed(3)})`);
-        });
     log.info('');
     
-    // CRITICAL FIX: Require minimum score of 0.5 to ensure house number matches
-    // This prevents incorrect matches like 307 matching to 303
-    // Since house number match is weighted 70%, exact match gives 0.7 minimum
-    const SCORE_THRESHOLD = 0.5;
+    // CRITICAL FIX v3.0: Require minimum street similarity to prevent wrong street matches
+    // Even with exact house number, we need SOME street name overlap to be confident
+    // Example: "3 Willow Close" should NOT match "3 Westgate Road"
+    const MIN_STREET_SIMILARITY = 0.3; // At least 30% of words must match
     
-    if (bestScore >= SCORE_THRESHOLD && bestMatch) {
-        log.info(`✅ Selected best match: "${bestMatch.address}"`);
-        log.info(`   Certificate: ${bestMatch.certificateNumber}`);
-        log.info(`   Final Score: ${bestScore.toFixed(3)}`);
-        return bestMatch;
-    } else {
-        log.warning(`❌ No good match found (best score: ${bestScore.toFixed(3)}, threshold: ${SCORE_THRESHOLD})`);
-        log.warning(`⚠️ This usually means the property doesn't have an EPC certificate`);
-        log.warning(`⚠️ Returning null instead of fallback to prevent incorrect matches`);
+    if (bestStreetScore < MIN_STREET_SIMILARITY) {
+        log.warning('❌ STREET NAME MISMATCH');
+        log.warning(`   Best street similarity: ${(bestStreetScore * 100).toFixed(1)}%`);
+        log.warning(`   Minimum required: ${(MIN_STREET_SIMILARITY * 100).toFixed(1)}%`);
+        log.warning('   House number matches but street names are too different');
+        log.warning('🚫 Returning NULL - likely different properties with same house number');
+        log.info('═'.repeat(80));
         return null;
     }
+    
+    // Check for ambiguity - if multiple matches have same street score, flag it
+    const sameScoreMatches = exactMatches.filter(m => {
+        const normalizedCertAddr = normalizeTextForMatching(m.certAddress);
+        const certWords = normalizedCertAddr.split(/\s+/).filter(w => w.length > 2);
+        const wordMatches = targetWords.filter(word => certWords.includes(word));
+        const streetScore = targetWords.length > 0 ? wordMatches.length / targetWords.length : 0;
+        return Math.abs(streetScore - bestStreetScore) < 0.01; // Same score within 1%
+    });
+    
+    if (sameScoreMatches.length > 1) {
+        log.warning('⚠️ AMBIGUOUS: Multiple certificates have same house number AND similar street names');
+        log.warning(`   Found ${sameScoreMatches.length} equally good matches`);
+        sameScoreMatches.forEach((m, idx) => {
+            log.warning(`   ${idx + 1}. ${m.certAddress}`);
+        });
+        log.warning('   Using first match but flagging as ambiguous for manual review');
+        log.info('═'.repeat(80));
+        
+        return {
+            certificate: bestMatch.cert,
+            matchStatus: 'Ambiguous',
+            matchDetails: {
+                matchType: bestMatch.matchType,
+                candidateCount: certificates.length,
+                exactMatchCount: exactMatches.length,
+                ambiguousCount: sameScoreMatches.length,
+                ambiguousAddresses: sameScoreMatches.map(m => m.certAddress)
+            }
+        };
+    }
+    
+    // Clear winner
+    log.info('✅ BEST MATCH SELECTED');
+    log.info(`   Address: "${bestMatch.certAddress}"`);
+    log.info(`   Certificate: ${bestMatch.cert.certificateNumber}`);
+    log.info(`   Match Type: ${bestMatch.matchType}`);
+    log.info(`   Street similarity: ${(bestStreetScore * 100).toFixed(1)}%`);
+    log.info('═'.repeat(80));
+    
+    return {
+        certificate: bestMatch.cert,
+        matchStatus: 'Exact Match',
+        matchDetails: {
+            matchType: bestMatch.matchType,
+            candidateCount: certificates.length,
+            exactMatchCount: exactMatches.length,
+            streetSimilarity: bestStreetScore
+        }
+    };
 }
 
 /**
@@ -449,11 +568,14 @@ async function fetchEPCDataViaAPI(postcode, address, apiKey = null) {
             
             log.info(`Found EPC via web scraping: Rating ${rating || 'N/A'}, Certificate #: ${certData.certificateNumber}`);
             log.info(`Certificate URL: ${certData.certificateURL}`);
+            log.info(`Match Status: ${certData.matchStatus || 'N/A'}`);
             return {
                 rating: rating,
                 certificateURL: certData.certificateURL,
                 certificateNumber: certData.certificateNumber,
-                floorArea: null // Floor area not available from scraping
+                floorArea: null, // Floor area not available from scraping
+                matchStatus: certData.matchStatus,
+                matchDetails: certData.matchDetails
             };
         } else {
             log.info('No EPC data found via web scraping');
@@ -901,6 +1023,6 @@ module.exports = {
     scrapeFloorAreaFromCertificate,
     scrapeRatingFromCertificate,
     extractHouseNumber,
-    scoreHouseNumberMatch,
+    isExactHouseNumberMatch,
     normalizeTextForMatching
 };

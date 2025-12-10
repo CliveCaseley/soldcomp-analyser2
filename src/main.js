@@ -442,6 +442,14 @@ async function enrichWithEPCData(properties, apiKey) {
                     property['EPC rating'] = epcData.rating;
                 }
                 
+                // CRITICAL FIX v3.0: Store EPC match status for transparency
+                if (epcData.matchStatus) {
+                    property['EPC_Match_Status'] = epcData.matchStatus;
+                    log.info(`  EPC Match Status: ${epcData.matchStatus}`);
+                } else {
+                    property['EPC_Match_Status'] = 'No Match Found';
+                }
+                
                 // BATCH 2: Check if EPC Certificate is manually edited before updating
                 if (epcData.certificateURL) {
                     // If property already has EPC Certificate, check for manual edit
@@ -456,6 +464,9 @@ async function enrichWithEPCData(properties, apiKey) {
                     } else {
                         log.info(`  ✓ Preserving manually edited EPC Certificate: ${property['EPC Certificate']}`);
                     }
+                } else {
+                    // No certificate URL means no match found
+                    property['EPC_Match_Status'] = 'No Match Found';
                 }
                 
                 // BATCH 1 ENHANCEMENT: Use EPC floor area as arbiter for conflicts
@@ -514,9 +525,13 @@ async function enrichWithEPCData(properties, apiKey) {
                         log.info(`  Using EPC floor area: ${epcSqFt} sq ft (${epcFloorAreaSqm} sqm)`);
                     }
                 }
+            } else {
+                // No EPC data found at all
+                property['EPC_Match_Status'] = 'No Match Found';
             }
         } catch (error) {
             log.warning(`Failed to fetch EPC data for ${property.Address}: ${error.message}`);
+            property['EPC_Match_Status'] = 'Error';
         }
     }
 }
