@@ -44,20 +44,22 @@ function isValidCertificateNumber(certificateNumber) {
 }
 
 /**
- * Scrape certificate numbers from postcode search page (NEW APPROACH - v2.5)
- * This bypasses the API entirely and scrapes directly from the web interface
- * The web interface provides direct links to certificates with certificate numbers in href
+ * V5.0: Scrape certificate table from postcode search page
+ * SIMPLIFIED APPROACH per user specification:
+ * 1. Search by postcode: https://find-energy-certificate.service.gov.uk/find-a-certificate/search-by-postcode?postcode=DN17+4JD
+ * 2. Parse HTML table containing addresses and certificate numbers
+ * 3. Extract all rows with addresses and certificate numbers
  * 
  * @param {string} postcode - Property postcode to search
- * @returns {Promise<Array>} Array of {certificateNumber, address, href, rating} objects
+ * @returns {Promise<Array>} Array of {certificateNumber, address, rating} objects from table
  */
-async function scrapeCertificateNumbersFromPostcode(postcode) {
+async function scrapeCertificateTable(postcode) {
     if (!postcode) {
         log.warning('Cannot scrape certificates: missing postcode');
         return [];
     }
     
-    log.info(`Scraping certificate numbers from postcode search page: ${postcode}`);
+    log.info(`📋 Scraping certificate table for postcode: ${postcode}`);
     
     try {
         const cleanPostcode = postcode.replace(/\s+/g, '');
@@ -73,80 +75,173 @@ async function scrapeCertificateNumbersFromPostcode(postcode) {
         const $ = cheerio.load(response.data);
         const certificates = [];
         
-        // Find all certificate links - they have format: href="/energy-certificate/XXXX-XXXX-XXXX-XXXX-XXXX"
+        // Parse the results table - each row contains address link and rating
+        // Look for govuk-link elements that link to certificates
         $('a.govuk-link[href^="/energy-certificate/"]').each((i, elem) => {
             const href = $(elem).attr('href');
             const address = $(elem).text().trim();
             
-            // Extract certificate number from href
-            // Format: /energy-certificate/2648-3961-7260-5043-7964
+            // Extract certificate number from href: /energy-certificate/9727-0009-2305-7219-1214
             const match = href.match(/\/energy-certificate\/([A-Z0-9-]+)/i);
             
             if (match && match[1]) {
                 const certificateNumber = match[1];
                 
                 if (isValidCertificateNumber(certificateNumber)) {
-                    // Try to find rating if available on the page
+                    // Find rating in the same row (typically in a govuk-tag)
                     let rating = null;
-                    const parent = $(elem).closest('.govuk-summary-list__row, .search-result');
-                    if (parent.length > 0) {
-                        const ratingText = parent.find('.govuk-tag, .energy-rating').text().trim();
-                        if (ratingText && /^[A-G]$/i.test(ratingText)) {
-                            rating = ratingText.toUpperCase();
+                    const row = $(elem).closest('tr, .govuk-summary-list__row, .search-result');
+                    if (row.length > 0) {
+                        // Look for rating tag in the row
+                        const ratingElem = row.find('.govuk-tag, .energy-rating, strong').filter(function() {
+                            const text = $(this).text().trim();
+                            return /^[A-G]$/i.test(text);
+                        }).first();
+                        
+                        if (ratingElem.length > 0) {
+                            rating = ratingElem.text().trim().toUpperCase();
                         }
                     }
                     
                     certificates.push({
                         certificateNumber: certificateNumber,
                         address: address,
-                        href: `https://find-energy-certificate.service.gov.uk${href}`,
                         rating: rating
                     });
                     
-                    log.info(`Found certificate: ${certificateNumber} for ${address}`);
+                    log.info(`   Found: ${certificateNumber} | ${address} | Rating: ${rating || 'N/A'}`);
                 }
             }
         });
         
-        log.info(`Scraped ${certificates.length} certificates from postcode search page`);
+        log.info(`📊 Found ${certificates.length} certificates in table`);
         return certificates;
         
     } catch (error) {
-        log.warning(`Failed to scrape certificate numbers: ${error.message}`);
+        log.warning(`❌ Failed to scrape certificate table: ${error.message}`);
         return [];
     }
 }
 
 
 /**
- * REWRITE v4.0: Get certificate number with strict address verification
- * Uses web scraping + individual certificate verification for accuracy
+ * V5.0: Match property address to certificate table row
+ * SIMPLIFIED MATCHING per user specification:
+ * 1. Extract house number from property address (e.g., "51a" from "51a Outgate")
+ * 2. Find table row with exact house number match
+ * 3. Return certificate number from matching row
  * 
- * NEW APPROACH:
- * 1. Scrape certificate numbers from postcode search page
- * 2. For each certificate, fetch full data from certificate page (including exact address)
- * 3. Compare certificate address with property address using exact house number matching
- * 4. Only return match if addresses match exactly
- * 5. If multiple matches, use floor area (if known) as tie-breaker
+ * @param {Array} certificates - Array of certificates from scrapeCertificateTable
+ * @param {string} propertyAddress - Property address to match
+ * @returns {Object|null} Matching certificate object or null
+ */
+function matchAddressToCertificateRow(certificates, propertyAddress) {
+    if (!certificates || certificates.length === 0) {
+        log.warning('⚠️ No certificates to match against');
+        return null;
+    }
+    
+    if (!propertyAddress) {
+        log.warning('⚠️ No property address provided');
+        return null;
+    }
+    
+    log.info(`🔍 Matching property address to certificate table row...`);
+    log.info(`   Property: "${propertyAddress}"`);
+    log.info('');
+    
+    // Extract house number from property address
+    const propertyHouseNum = extractHouseNumber(propertyAddress);
+    
+    if (!propertyHouseNum.primary) {
+        log.warning('❌ Cannot extract house number from property address');
+        return null;
+    }
+    
+    log.info(`🔢 Property house number: ${propertyHouseNum.primary}${propertyHouseNum.flat || ''}`);
+    log.info('');
+    
+    // Normalize property address for street matching
+    const normalizedProperty = normalizeTextForMatching(propertyAddress);
+    const propertyWords = normalizedProperty.split(/\s+/).filter(w => w.length > 2);
+    
+    // Find all table rows with exact house number match
+    const matches = [];
+    
+    for (const cert of certificates) {
+        const certHouseNum = extractHouseNumber(cert.address);
+        const matchResult = isExactHouseNumberMatch(propertyHouseNum, certHouseNum);
+        
+        log.info(`   📋 "${cert.address}"`);
+        log.info(`      House#: ${certHouseNum.primary}${certHouseNum.flat || ''} | Cert: ${cert.certificateNumber} | Rating: ${cert.rating || 'N/A'}`);
+        log.info(`      Match: ${matchResult.isExactMatch ? '✅' : '❌'} (${matchResult.matchType})`);
+        
+        if (matchResult.isExactMatch) {
+            // Verify street similarity
+            const normalizedCert = normalizeTextForMatching(cert.address);
+            const certWords = normalizedCert.split(/\s+/).filter(w => w.length > 2);
+            const wordMatches = propertyWords.filter(word => certWords.includes(word));
+            const streetSimilarity = propertyWords.length > 0 ? wordMatches.length / propertyWords.length : 0;
+            
+            log.info(`      Street similarity: ${(streetSimilarity * 100).toFixed(1)}%`);
+            
+            matches.push({
+                cert: cert,
+                matchType: matchResult.matchType,
+                streetSimilarity: streetSimilarity
+            });
+        }
+        
+        log.info('');
+    }
+    
+    if (matches.length === 0) {
+        log.warning('❌ No exact house number match found in table');
+        return null;
+    }
+    
+    if (matches.length === 1) {
+        log.info(`✅ Found exact match: ${matches[0].cert.certificateNumber}`);
+        return matches[0].cert;
+    }
+    
+    // Multiple matches - pick best one by street similarity
+    log.info(`⚠️ Multiple matches found (${matches.length}), selecting best by street similarity...`);
+    const bestMatch = matches.reduce((best, current) => 
+        current.streetSimilarity > best.streetSimilarity ? current : best
+    );
+    
+    log.info(`✅ Selected best match: ${bestMatch.cert.certificateNumber} (${(bestMatch.streetSimilarity * 100).toFixed(1)}% similarity)`);
+    return bestMatch.cert;
+}
+
+/**
+ * V5.0: Get certificate number using postcode search table matching
+ * SIMPLIFIED APPROACH per user specification:
+ * 1. Search by postcode and parse HTML table
+ * 2. Match property address to table row (exact house number)
+ * 3. Extract certificate number from matching row
+ * 4. Fetch certificate page and extract details
+ * 5. Verify address on certificate matches property
  * 
  * @param {string} postcode - Property postcode
  * @param {string} address - Property address for matching
- * @param {string} apiKey - EPC API key (optional, kept for compatibility but not used)
- * @param {number} knownFloorArea - Optional floor area in sqm for better matching when multiple certificates exist
- * @returns {Promise<Object|null>} Certificate data with number or null
+ * @param {string} apiKey - EPC API key (optional, not used)
+ * @param {number} knownFloorArea - Optional floor area (not used in v5.0)
+ * @returns {Promise<Object|null>} Certificate data or null
  */
 async function getCertificateNumber(postcode, address, apiKey = null, knownFloorArea = null) {
     log.info('═'.repeat(80));
-    log.info('🔎 EPC CERTIFICATE LOOKUP v4.0 (STRICT VERIFICATION)');
+    log.info('🔎 EPC CERTIFICATE LOOKUP v5.0 (POSTCODE TABLE SEARCH)');
     log.info('═'.repeat(80));
     
     if (!postcode) {
-        log.warning('⚠️ Cannot look up certificate number: missing postcode');
+        log.warning('⚠️ Cannot look up certificate: missing postcode');
         return null;
     }
     
     if (!address) {
-        log.warning('⚠️ Cannot look up certificate number: missing address');
+        log.warning('⚠️ Cannot look up certificate: missing address');
         return null;
     }
     
@@ -155,8 +250,8 @@ async function getCertificateNumber(postcode, address, apiKey = null, knownFloor
     log.info('');
     
     try {
-        // STEP 1: Scrape certificate numbers from postcode search page
-        const certificates = await scrapeCertificateNumbersFromPostcode(postcode);
+        // STEP 1: Scrape certificate table from postcode search page
+        const certificates = await scrapeCertificateTable(postcode);
         
         if (certificates.length === 0) {
             log.warning('❌ No certificates found for postcode');
@@ -164,221 +259,70 @@ async function getCertificateNumber(postcode, address, apiKey = null, knownFloor
             return null;
         }
         
-        log.info(`📊 Found ${certificates.length} certificates for postcode`);
+        log.info(`📊 Found ${certificates.length} certificates in table`);
         log.info('');
         
-        // STEP 2: Extract property house number for matching
-        const propertyHouseNum = extractHouseNumber(address);
-        log.info(`🔢 Property House Number:`);
-        log.info(`   Primary: ${propertyHouseNum.primary || 'NONE'}`);
-        log.info(`   Flat/Suffix: ${propertyHouseNum.flat || 'NONE'}`);
-        log.info('');
+        // STEP 2: Match property address to table row (exact house number)
+        const matchedCert = matchAddressToCertificateRow(certificates, address);
         
-        if (!propertyHouseNum.primary) {
-            log.warning('❌ Cannot extract house number from property address');
+        if (!matchedCert) {
+            log.warning('❌ No matching certificate found in table');
             log.info('═'.repeat(80));
             return null;
         }
         
-        // STEP 3: Check each certificate by scraping its page for exact address
-        log.info('🔍 Checking certificates for exact address match...');
+        log.info(`✅ Matched certificate: ${matchedCert.certificateNumber}`);
         log.info('');
         
-        const normalizedPropertyAddr = normalizeTextForMatching(address);
-        const propertyWords = normalizedPropertyAddr.split(/\s+/).filter(w => w.length > 2);
+        // STEP 3: Fetch certificate page and extract full details
+        const certificateURL = `https://find-energy-certificate.service.gov.uk/energy-certificate/${matchedCert.certificateNumber}`;
+        log.info(`📄 Fetching certificate details from: ${certificateURL}`);
+        const certData = await scrapeCertificateData(certificateURL);
         
-        const matchingCertificates = []; // Collect ALL matches instead of returning first one
+        if (!certData.address) {
+            log.warning('⚠️ Could not extract address from certificate page');
+        }
         
-        for (let i = 0; i < certificates.length; i++) {
-            const cert = certificates[i];
-            log.info(`─`.repeat(80));
-            log.info(`📄 Certificate ${i + 1}/${certificates.length}: ${cert.certificateNumber}`);
-            log.info(`   Search Page Address: "${cert.address}"`);
-            
-            // Scrape full certificate data including exact address
-            const certData = await scrapeCertificateData(cert.href);
-            
-            if (!certData.address) {
-                log.warning(`   ⚠️ Could not extract address from certificate page`);
-                continue;
-            }
-            
-            log.info(`   📮 Certificate Page Address: "${certData.address}"`);
-            
-            // Extract house number from certificate address
+        // STEP 4: Verify address on certificate matches property
+        let addressVerified = false;
+        if (certData.address) {
             const certHouseNum = extractHouseNumber(certData.address);
-            log.info(`   🔢 Certificate House#: ${certHouseNum.primary}${certHouseNum.flat || ''}`);
-            
-            // Check for exact house number match
+            const propertyHouseNum = extractHouseNumber(address);
             const matchResult = isExactHouseNumberMatch(propertyHouseNum, certHouseNum);
-            log.info(`   ${matchResult.isExactMatch ? '✅' : '❌'} House Number: ${matchResult.matchType}`);
             
-            if (!matchResult.isExactMatch) {
-                log.info(`   ⏭️  Skipping - house number doesn't match`);
-                continue;
-            }
+            log.info(`📮 Certificate Address: "${certData.address}"`);
+            log.info(`🔍 Address Verification: ${matchResult.isExactMatch ? '✅ MATCH' : '⚠️ MISMATCH'} (${matchResult.matchType})`);
             
-            // House number matches - verify street name similarity
-            const normalizedCertAddr = normalizeTextForMatching(certData.address);
-            const certWords = normalizedCertAddr.split(/\s+/).filter(w => w.length > 2);
-            const wordMatches = propertyWords.filter(word => certWords.includes(word));
-            const streetSimilarity = propertyWords.length > 0 ? wordMatches.length / propertyWords.length : 0;
-            
-            log.info(`   📍 Street Similarity: ${(streetSimilarity * 100).toFixed(1)}%`);
-            
-            const MIN_STREET_SIMILARITY = 0.3;
-            if (streetSimilarity < MIN_STREET_SIMILARITY) {
-                log.info(`   ⏭️  Skipping - street name too different (need ${(MIN_STREET_SIMILARITY * 100).toFixed(1)}%)`);
-                continue;
-            }
-            
-            // This is a valid match - add to list
-            log.info(`   ✅ VALID MATCH - added to candidates`);
-            matchingCertificates.push({
-                cert: cert,
-                certData: certData,
-                matchResult: matchResult,
-                streetSimilarity: streetSimilarity
-            });
+            addressVerified = matchResult.isExactMatch;
         }
+        
+        // Use rating from certificate page if available, otherwise use rating from table
+        const finalRating = certData.rating || matchedCert.rating;
         
         log.info('');
-        log.info(`📊 Found ${matchingCertificates.length} matching certificate(s)`);
-        
-        // If no matches found, return null
-        if (matchingCertificates.length === 0) {
-            log.info('');
-            log.info('❌ ═══════════════════════════════════════════════════════════════════════════');
-            log.info('❌ NO EXACT MATCH FOUND');
-            log.info('❌ ═══════════════════════════════════════════════════════════════════════════');
-            log.info(`   Checked ${certificates.length} certificates`);
-            log.info(`   Property: "${address}"`);
-            log.info(`   None had exact house number + street match`);
-            log.info('   🚫 Returning NULL - better no data than wrong data');
-            log.info('═'.repeat(80));
-            return null;
-        }
-        
-        // If only one match, return it
-        if (matchingCertificates.length === 1) {
-            const match = matchingCertificates[0];
-            log.info('');
-            log.info('✅ ═══════════════════════════════════════════════════════════════════════════');
-            log.info('✅ SINGLE EXACT MATCH FOUND!');
-            log.info('✅ ═══════════════════════════════════════════════════════════════════════════');
-            log.info(`   Certificate: ${match.cert.certificateNumber}`);
-            log.info(`   Property Address: "${address}"`);
-            log.info(`   Certificate Address: "${match.certData.address}"`);
-            log.info(`   Rating: ${match.certData.rating || 'N/A'}`);
-            log.info(`   Floor Area: ${match.certData.floorArea ? match.certData.floorArea + ' sqm' : 'N/A'}`);
-            log.info(`   Match Type: ${match.matchResult.matchType}`);
-            log.info(`   Street Similarity: ${(match.streetSimilarity * 100).toFixed(1)}%`);
-            log.info('═'.repeat(80));
-            
-            return {
-                certificateNumber: match.cert.certificateNumber,
-                certificateURL: match.cert.href,
-                rating: match.certData.rating,
-                floorArea: match.certData.floorArea,
-                address: match.certData.address,
-                matchStatus: 'Exact Match',
-                matchDetails: {
-                    matchType: match.matchResult.matchType,
-                    streetSimilarity: match.streetSimilarity,
-                    certificateAddress: match.certData.address,
-                    propertyAddress: address
-                }
-            };
-        }
-        
-        // Multiple matches found - need to pick the best one
-        // Prioritize: 1) floor area match (if known), 2) addresses WITHOUT property names, 3) better street similarity
-        log.info('');
-        log.info('⚠️ ═══════════════════════════════════════════════════════════════════════════');
-        log.info('⚠️  MULTIPLE MATCHES FOUND - Selecting best match');
-        log.info('⚠️ ═══════════════════════════════════════════════════════════════════════════');
-        if (knownFloorArea) {
-            log.info(`   Known Floor Area: ${knownFloorArea} sqm (will use for matching)`);
-        }
-        log.info('');
-        
-        matchingCertificates.forEach((match, idx) => {
-            log.info(`   ${idx + 1}. ${match.cert.certificateNumber}`);
-            log.info(`      Address: "${match.certData.address}"`);
-            log.info(`      Rating: ${match.certData.rating}, Floor Area: ${match.certData.floorArea} sqm`);
-            log.info(`      Street Similarity: ${(match.streetSimilarity * 100).toFixed(1)}%`);
-        });
-        
-        let bestMatch = null;
-        let bestScore = -1;
-        let selectionReason = '';
-        
-        for (const match of matchingCertificates) {
-            let score = match.streetSimilarity; // Base score from street similarity
-            let reasons = [];
-            
-            // PRIORITY 1: If floor area is known, heavily weight exact matches
-            if (knownFloorArea && match.certData.floorArea) {
-                const floorDiff = Math.abs(match.certData.floorArea - knownFloorArea);
-                if (floorDiff === 0) {
-                    score += 10; // Exact floor area match is VERY strong signal
-                    reasons.push('exact floor area match');
-                } else if (floorDiff <= 2) {
-                    score += 5; // Within 2 sqm is also very good
-                    reasons.push('floor area within 2 sqm');
-                } else if (floorDiff <= 5) {
-                    score += 2; // Within 5 sqm is okay
-                    reasons.push('floor area within 5 sqm');
-                }
-            }
-            
-            // PRIORITY 2: Prefer addresses without property names (slightly)
-            const hasPropertyName = match.certData.address.match(/^[a-z\s]+,\s*\d+/i);
-            if (!hasPropertyName) {
-                score += 0.5;
-                reasons.push('no property name');
-            }
-            
-            if (score > bestScore) {
-                bestScore = score;
-                bestMatch = match;
-                selectionReason = reasons.join(', ') || 'best street similarity';
-            }
-        }
-        
-        log.info('');
-        log.info('✅ SELECTED BEST MATCH:');
-        log.info(`   Certificate: ${bestMatch.cert.certificateNumber}`);
-        log.info(`   Address: "${bestMatch.certData.address}"`);
-        log.info(`   Rating: ${bestMatch.certData.rating}`);
-        log.info(`   Floor Area: ${bestMatch.certData.floorArea} sqm`);
-        log.info(`   Selection Reason: ${selectionReason}`);
+        log.info('✅ ═══════════════════════════════════════════════════════════════════════════');
+        log.info('✅ CERTIFICATE FOUND');
+        log.info('✅ ═══════════════════════════════════════════════════════════════════════════');
+        log.info(`   Certificate: ${matchedCert.certificateNumber}`);
+        log.info(`   Property: "${address}"`);
+        log.info(`   Certificate Address: "${certData.address || matchedCert.address}"`);
+        log.info(`   Rating: ${finalRating || 'N/A'}`);
+        log.info(`   Floor Area: ${certData.floorArea ? certData.floorArea + ' sqm' : 'N/A'}`);
+        log.info(`   Address Verified: ${addressVerified ? 'YES' : 'NO'}`);
         log.info('═'.repeat(80));
         
         return {
-            certificateNumber: bestMatch.cert.certificateNumber,
-            certificateURL: bestMatch.cert.href,
-            rating: bestMatch.certData.rating,
-            floorArea: bestMatch.certData.floorArea,
-            address: bestMatch.certData.address,
-            matchStatus: matchingCertificates.length > 1 ? 'Multiple Matches' : 'Exact Match',
-            matchDetails: {
-                matchType: bestMatch.matchResult.matchType,
-                streetSimilarity: bestMatch.streetSimilarity,
-                certificateAddress: bestMatch.certData.address,
-                propertyAddress: address,
-                totalMatches: matchingCertificates.length,
-                allMatches: matchingCertificates.map(m => ({
-                    certificateNumber: m.cert.certificateNumber,
-                    address: m.certData.address,
-                    rating: m.certData.rating,
-                    floorArea: m.certData.floorArea
-                }))
-            }
+            certificateNumber: matchedCert.certificateNumber,
+            certificateURL: certificateURL,
+            rating: finalRating,
+            floorArea: certData.floorArea,
+            address: certData.address || matchedCert.address,
+            matchStatus: 'Exact Match',
+            addressVerified: addressVerified
         };
         
     } catch (error) {
-        log.warning(`❌ Failed to get certificate number: ${error.message}`);
+        log.warning(`❌ Failed to get certificate: ${error.message}`);
         log.error(error.stack);
         log.info('═'.repeat(80));
         return null;
@@ -1113,8 +1057,9 @@ module.exports = {
     createEPCLookupRow,
     isValidCertificateNumber,
     getCertificateNumber,
-    scrapeCertificateNumbersFromPostcode,
-    findBestAddressMatchFromScrapedData,
+    scrapeCertificateTable, // v5.0: New function
+    matchAddressToCertificateRow, // v5.0: New function
+    findBestAddressMatchFromScrapedData, // Legacy function (kept for compatibility)
     scrapeFloorAreaFromCertificate,
     scrapeRatingFromCertificate,
     scrapeCertificateData,
