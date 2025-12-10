@@ -1,6 +1,7 @@
 const fuzzball = require('fuzzball');
 const { log } = require('apify');
-const { normalizePreHeaderRow } = require('./csvParser');
+const { normalizePreHeaderRow, validateAndCorrectPropertyData } = require('./csvParser');
+const { scrapeCertificateData } = require('./epcHandler');
 
 /**
  * Common variations of "target" to match against
@@ -77,6 +78,79 @@ function cleanTargetAddress(address) {
 }
 
 /**
+ * Fill missing fields from EPC certificate data
+ * PRIORITY RULES:
+ * 1. Manual data is NEVER overwritten (preserve user edits)
+ * 2. EPC certificate is authoritative source for missing fields
+ * 3. Only fills fields that are empty or undefined
+ * 
+ * FILLS:
+ * - Sq. ft / Sqm (floor area from EPC)
+ * - EPC rating
+ * - Type (property type from EPC)
+ * 
+ * @param {Object} target - Target property object
+ * @returns {Promise<Object>} Updated target property with filled fields
+ */
+async function fillMissingFieldsFromEPC(target) {
+    if (!target['EPC Certificate']) {
+        log.info('  No EPC Certificate URL provided, skipping EPC data fill');
+        return target;
+    }
+    
+    log.info('  Attempting to fill missing fields from EPC certificate...');
+    log.info(`  EPC Certificate URL: ${target['EPC Certificate']}`);
+    
+    try {
+        // Scrape data from EPC certificate
+        const epcData = await scrapeCertificateData(target['EPC Certificate']);
+        
+        if (!epcData || (!epcData.floorArea && !epcData.rating && !epcData.propertyType)) {
+            log.warning('  Failed to extract useful data from EPC certificate');
+            return target;
+        }
+        
+        log.info('  EPC certificate data extracted:');
+        if (epcData.floorArea) log.info(`    Floor area: ${epcData.floorArea} sqm`);
+        if (epcData.rating) log.info(`    EPC rating: ${epcData.rating}`);
+        if (epcData.propertyType) log.info(`    Property type: ${epcData.propertyType}`);
+        
+        // Fill missing floor area
+        if (epcData.floorArea && (!target['Sqm'] || target['Sqm'] === '' || target['Sqm'] === 0)) {
+            target['Sqm'] = epcData.floorArea;
+            // Convert to sqft
+            target['Sq. ft'] = Math.round(epcData.floorArea * 10.764);
+            log.info(`  ✓ Filled floor area from EPC: ${target['Sq. ft']} sqft (${target['Sqm']} sqm)`);
+            
+            // Recalculate £/sqft if we have a price
+            if (target['Price'] && target['Price'] !== '' && target['Price'] > 0) {
+                target['£/sqft'] = Math.round(target['Price'] / target['Sq. ft']);
+                log.info(`  ✓ Recalculated £/sqft: £${target['£/sqft']}`);
+            }
+        }
+        
+        // Fill missing EPC rating
+        if (epcData.rating && (!target['EPC rating'] || target['EPC rating'] === '')) {
+            target['EPC rating'] = epcData.rating;
+            log.info(`  ✓ Filled EPC rating from EPC: ${epcData.rating}`);
+        }
+        
+        // Fill missing property type
+        if (epcData.propertyType && (!target['Type'] || target['Type'] === '')) {
+            target['Type'] = epcData.propertyType;
+            log.info(`  ✓ Filled property type from EPC: ${epcData.propertyType}`);
+        }
+        
+        return target;
+        
+    } catch (error) {
+        log.error(`  Failed to fill missing fields from EPC: ${error.message}`);
+        return target;
+    }
+}
+
+
+/**
  * Find the target property in the dataset using fuzzy matching
  * 
  * CRITICAL FIX (v2.3): Pre-Header Row Target Detection
@@ -84,14 +158,22 @@ function cleanTargetAddress(address) {
  * - Handles cases where target appears before the CSV header row
  * - Normalizes pre-header rows on-the-fly for target detection
  * 
+ * ENHANCED (v3.0): Complete Field Capture
+ * - Accepts headerMapping to capture ALL fields from pre-header rows
+ * - Enables complete target property data transfer (Bedrooms, Type, Tenure, Sq. ft, etc.)
+ * 
  * @param {Array<Object>} properties - Array of normalized property objects
  * @param {Array<Array>} preHeaderRows - Raw CSV rows that appear before the header (optional)
+ * @param {Object} headerMapping - Mapping of column indices to standard headers (optional)
  * @returns {Object} Result containing target property and remaining properties
  * @throws {Error} If no target found, multiple targets found, or target missing required fields
  */
-function findTarget(properties, preHeaderRows = []) {
+async function findTarget(properties, preHeaderRows = [], headerMapping = null) {
     log.info('Searching for target property...');
     log.info(`Searching in ${properties.length} normalized properties and ${preHeaderRows.length} pre-header rows`);
+    if (headerMapping) {
+        log.info('Header mapping provided for complete field capture');
+    }
     
     const targetCandidates = [];
 
@@ -100,8 +182,8 @@ function findTarget(properties, preHeaderRows = []) {
     preHeaderRows.forEach((rawRow, index) => {
         log.info(`Checking pre-header row ${index}:`, rawRow);
         
-        // Normalize the raw row to a property object
-        const property = normalizePreHeaderRow(rawRow);
+        // Normalize the raw row to a property object, passing headerMapping for complete field capture
+        const property = normalizePreHeaderRow(rawRow, headerMapping);
         
         let isTarget = false;
         let targetIndicatorFound = '';
@@ -187,7 +269,7 @@ function findTarget(properties, preHeaderRows = []) {
     }
 
     // Extract target property
-    const { property: targetProperty, index: targetIndex, source: targetSource } = targetCandidates[0];
+    let { property: targetProperty, index: targetIndex, source: targetSource } = targetCandidates[0];
     log.info(`Target found from ${targetSource} at index ${targetIndex}`);
     
     // CRITICAL FIX: Target indicator can be in ANY field (Date, Address, etc.)
@@ -306,6 +388,27 @@ function findTarget(properties, preHeaderRows = []) {
     }
 
     log.info('Target property successfully identified and validated');
+    
+    // STEP 1: Validate and correct property data (detect column swaps, etc.)
+    log.info('=== Validating and correcting target property data ===');
+    const validationResult = validateAndCorrectPropertyData(targetProperty);
+    
+    if (validationResult.warnings.length > 0) {
+        log.warning('Validation warnings:');
+        validationResult.warnings.forEach(warning => log.warning(`  - ${warning}`));
+    }
+    
+    if (validationResult.corrections.length > 0) {
+        log.info('Auto-corrections applied:');
+        validationResult.corrections.forEach(correction => log.info(`  ✓ ${correction}`));
+        targetProperty = validationResult.correctedProperty;
+    }
+    
+    // STEP 2: Fill missing fields from EPC certificate (if available)
+    if (targetProperty['EPC Certificate']) {
+        log.info('=== Filling missing fields from EPC certificate ===');
+        targetProperty = await fillMissingFieldsFromEPC(targetProperty);
+    }
     
     // Log target info based on what data we have
     if (targetProperty.Address && targetProperty.Postcode) {

@@ -48,6 +48,7 @@ Actor.main(async () => {
         const parseResult = parseCSV(csvContent);
         let properties = parseResult.normalizedData;
         const preHeaderRows = parseResult.preHeaderRows;
+        const headerMapping = parseResult.headerMapping;
         log.info(`Parsed ${properties.length} properties and ${preHeaderRows.length} pre-header rows`);
         
         // Step 4: Clean and normalize properties
@@ -102,7 +103,7 @@ Actor.main(async () => {
         
         // Step 5: Find target property (CRITICAL)
         log.info('=== STEP 4: Finding target property ===');
-        const { target, comparables } = findTarget(properties, preHeaderRows);
+        const { target, comparables } = await findTarget(properties, preHeaderRows, headerMapping);
         log.info(`Target property: ${target.Address}, ${target.Postcode}`);
         log.info(`Comparable properties: ${comparables.length}`);
         

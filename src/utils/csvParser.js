@@ -396,10 +396,16 @@ function normalizeData(records, headerMapping, headerRowIndex) {
  * Normalize a single pre-header row for target detection
  * Converts a raw CSV row array into a property object
  * 
+ * ENHANCED (v3.0): Complete Field Capture with Header Mapping
+ * - Now accepts headerMapping to properly map ALL fields (Bedrooms, Type, Tenure, Price, Sq. ft, etc.)
+ * - Maps pre-header row cells to standard headers based on column positions
+ * - Captures complete target property data, not just Address/Postcode/EPC
+ * 
  * @param {Array} row - Raw CSV row array
+ * @param {Object} headerMapping - Optional mapping of column indices to standard headers
  * @returns {Object} Normalized property object with standard headers
  */
-function normalizePreHeaderRow(row) {
+function normalizePreHeaderRow(row, headerMapping = null) {
     const normalizedRow = {};
     
     // Initialize all standard headers with empty values
@@ -425,6 +431,26 @@ function normalizePreHeaderRow(row) {
                 if (/^https?:\/\//i.test(nextCellStr) && nextCellStr.includes('energy-certificate')) {
                     normalizedRow['EPC Certificate'] = nextCellStr;
                     log.info(`  ✓ Captured EPC Certificate URL from column ${i + 1}: ${nextCellStr}`);
+                }
+            }
+        }
+    }
+    
+    // NEW: If we have headerMapping, use it to capture ALL fields from the pre-header row
+    if (headerMapping) {
+        log.info('  Using headerMapping to capture all fields from pre-header row');
+        for (const [colIndex, standardHeader] of Object.entries(headerMapping)) {
+            const colIndexNum = parseInt(colIndex);
+            if (colIndexNum < row.length && row[colIndexNum]) {
+                const cellValue = String(row[colIndexNum]).trim();
+                // Skip empty cells and cells we've already captured (like EPC Certificate labels)
+                if (cellValue && cellValue !== '' && !normalizedRow[standardHeader]) {
+                    // Skip EPC labels (we already captured the URL) and target indicators
+                    if (!/epc\s*(certificate|cert|url|link)?|energy\s*certificate/i.test(cellValue) &&
+                        !/^target\s+(is|=|:)|^tgt\s*:?|^subject\s+(property)?:?/i.test(cellValue)) {
+                        normalizedRow[standardHeader] = cellValue;
+                        log.info(`  Captured ${standardHeader}: "${cellValue}" from column ${colIndexNum}`);
+                    }
                 }
             }
         }
@@ -536,6 +562,89 @@ function normalizePreHeaderRow(row) {
     return normalizedRow;
 }
 
+
+/**
+ * Validate and sense-check property data for common errors
+ * 
+ * DETECTS:
+ * - Sqft/Sqm column swaps (e.g., 81 sqft with £872/sqft suggests 81 is actually sqm)
+ * - Suspicious value combinations
+ * - Inconsistent data
+ * 
+ * AUTO-CORRECTS:
+ * - Obvious column swaps
+ * - Converts between sqft and sqm when needed
+ * 
+ * @param {Object} property - Property data object to validate
+ * @returns {Object} Object with validation results: { isValid, warnings, corrections, correctedProperty }
+ */
+function validateAndCorrectPropertyData(property) {
+    const warnings = [];
+    const corrections = [];
+    let correctedProperty = { ...property };
+    
+    // Check for sqft/sqm column swap
+    // HEURISTICS:
+    // 1. UK properties typically range 400-3000 sqft (37-279 sqm)
+    // 2. £/sqft typically ranges £100-£600 in UK
+    // 3. £/sqm typically ranges £1000-£6000 in UK
+    // 4. If we see small sqft (<100) with very high £/sqft (>800), likely a swap
+    
+    const sqft = parseFloat(correctedProperty['Sq. ft']);
+    const pricePerSqft = parseFloat(correctedProperty['£/sqft']);
+    const price = parseFloat(correctedProperty['Price']);
+    
+    if (!isNaN(sqft) && !isNaN(pricePerSqft)) {
+        // Detect suspicious combinations
+        const isSuspiciouslySmallSqft = sqft < 100;  // Less than 100 sqft is unusual for UK property
+        const isSuspiciouslyHighPricePerSqft = pricePerSqft > 800;  // Over £800/sqft is extremely high
+        
+        // If both conditions are met, likely a sqft/sqm column swap
+        if (isSuspiciouslySmallSqft && isSuspiciouslyHighPricePerSqft) {
+            warnings.push(`Detected likely sqft/sqm column swap: ${sqft} sqft with £${pricePerSqft}/sqft`);
+            
+            // AUTO-CORRECT: Assume the "sqft" value is actually sqm
+            const actualSqm = sqft;
+            const actualSqft = Math.round(actualSqm * 10.764);  // Convert sqm to sqft
+            
+            // The "£/sqft" value is actually £/sqm
+            const actualPricePerSqm = pricePerSqft;
+            const actualPricePerSqft = Math.round(actualPricePerSqm / 10.764);
+            
+            corrections.push(`Auto-corrected column swap: ${actualSqft} sqft (from ${actualSqm} sqm), £${actualPricePerSqft}/sqft (from £${actualPricePerSqm}/sqm)`);
+            
+            correctedProperty['Sq. ft'] = actualSqft;
+            correctedProperty['Sqm'] = actualSqm;
+            correctedProperty['£/sqft'] = actualPricePerSqft;
+            
+            log.warning(`  Column swap detected and corrected:`);
+            log.warning(`    Original: ${sqft} sqft, £${pricePerSqft}/sqft`);
+            log.warning(`    Corrected: ${actualSqft} sqft (${actualSqm} sqm), £${actualPricePerSqft}/sqft`);
+        }
+    }
+    
+    // Additional validation: Check if £/sqft calculation matches the given values
+    if (!isNaN(price) && !isNaN(correctedProperty['Sq. ft']) && !isNaN(correctedProperty['£/sqft'])) {
+        const calculatedPricePerSqft = Math.round(price / correctedProperty['Sq. ft']);
+        const givenPricePerSqft = Math.round(correctedProperty['£/sqft']);
+        const difference = Math.abs(calculatedPricePerSqft - givenPricePerSqft);
+        
+        // Allow 5% tolerance for rounding errors
+        const tolerance = givenPricePerSqft * 0.05;
+        if (difference > tolerance && difference > 10) {
+            warnings.push(`Price/sqft mismatch: calculated £${calculatedPricePerSqft}/sqft vs given £${givenPricePerSqft}/sqft (difference: £${difference})`);
+        }
+    }
+    
+    return {
+        isValid: warnings.length === 0,
+        warnings,
+        corrections,
+        correctedProperty
+    };
+}
+
+
 /**
  * Clean and normalize a single property object
  * 
@@ -611,5 +720,6 @@ module.exports = {
     parseCSV,
     cleanProperty,
     normalizePreHeaderRow,
+    validateAndCorrectPropertyData,
     STANDARD_HEADERS
 };
