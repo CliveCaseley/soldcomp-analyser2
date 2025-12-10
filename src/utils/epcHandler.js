@@ -108,16 +108,28 @@ function extractHouseNumber(address) {
 
 /**
  * Check if two house numbers match exactly
+ * 
+ * STRICT MATCHING RULES:
+ * ======================
+ * 1. Primary house numbers MUST match exactly (9 != 1, 13 != 1, 10 != 1)
+ * 2. If target has flat/suffix (e.g., "10b"), candidate MUST also have it or be the building
+ * 3. If target has no flat, candidate CAN have flat (e.g., target "9" matches cert "9a")
+ * 4. NO exceptions, NO fuzzy matching on numbers
  */
 function isExactHouseNumberMatch(target, candidate) {
+    // Rule 1: Both must have primary house number
     if (!target.primary || !candidate.primary) {
         return { isExactMatch: false, matchType: 'missing_house_number' };
     }
     
+    // Rule 2: Primary numbers MUST match EXACTLY (this is the critical check)
     if (target.primary !== candidate.primary) {
         return { isExactMatch: false, matchType: 'different_house_number' };
     }
     
+    // At this point, primary numbers match. Now check flat/suffix.
+    
+    // Rule 3: Both have flats - they must match exactly
     if (target.flat && candidate.flat) {
         if (target.flat === candidate.flat) {
             return { isExactMatch: true, matchType: 'exact_with_flat' };
@@ -126,14 +138,21 @@ function isExactHouseNumberMatch(target, candidate) {
         }
     }
     
+    // Rule 4: Target has no flat, candidate has flat
+    // This is OK - target might be referring to whole building
+    // Example: target "9 Westbourne" matches cert "9a Westbourne"
     if (!target.flat && candidate.flat) {
         return { isExactMatch: true, matchType: 'target_whole_building' };
     }
     
+    // Rule 5: Target has flat, candidate doesn't
+    // This is NOT OK - target is specific about flat/suffix
+    // Example: target "10b King Edward" should NOT match cert "10 King Edward"
     if (target.flat && !candidate.flat) {
         return { isExactMatch: false, matchType: 'target_has_flat_certificate_doesnt' };
     }
     
+    // Rule 6: Neither has flat - perfect match
     return { isExactMatch: true, matchType: 'exact_match' };
 }
 
@@ -274,6 +293,22 @@ async function scrapeCertificateNumbersFromPostcode(postcode) {
 
 /**
  * HYBRID STEP 3: Match property address to API data and scraped certificate numbers
+ * 
+ * CRITICAL FIX: STRICT EXACT HOUSE NUMBER MATCHING
+ * ================================================
+ * This function now enforces ABSOLUTE house number matching.
+ * Properties at #9 will NEVER match certificates for #1.
+ * Properties at #13 will NEVER match certificates for #1.
+ * Properties at #10b will NEVER match certificates for #1.
+ * 
+ * Algorithm:
+ * 1. Extract house number from property address (e.g., "9 Westbourne Drive" -> {primary: "9"})
+ * 2. FILTER API results: Keep ONLY entries with exact house number match
+ * 3. FILTER scraped certs: Keep ONLY entries with exact house number match
+ * 4. If NO exact matches after filtering, return NULL immediately
+ * 5. Only THEN calculate street similarity on the filtered subset
+ * 
+ * No fuzzy logic. No similarity scoring on numbers. Zero tolerance for house number mismatches.
  */
 function matchPropertyToEPCData(propertyAddress, apiResults, scrapedCerts) {
     if (!propertyAddress) {
@@ -283,6 +318,7 @@ function matchPropertyToEPCData(propertyAddress, apiResults, scrapedCerts) {
     
     log.info(`🔍 Matching property: "${propertyAddress}"`);
     
+    // STEP 1: Extract house number from property address
     const propertyHouseNum = extractHouseNumber(propertyAddress);
     
     if (!propertyHouseNum.primary) {
@@ -292,14 +328,9 @@ function matchPropertyToEPCData(propertyAddress, apiResults, scrapedCerts) {
     
     log.info(`   House#: ${propertyHouseNum.primary}${propertyHouseNum.flat || ''}`);
     
-    const normalizedProperty = normalizeTextForMatching(propertyAddress);
-    const propertyWords = normalizedProperty.split(/\s+/).filter(w => w.length > 2);
-    
-    // Find matching entries in both API and scraped data
-    const matches = [];
-    
-    // Match against API results (these have full data but no certificate-number)
-    for (const apiResult of apiResults) {
+    // STEP 2: STRICTLY FILTER API results - Keep ONLY exact house number matches
+    log.info(`   📊 Total API results before filtering: ${apiResults.length}`);
+    const filteredAPIResults = apiResults.filter(apiResult => {
         const apiAddress = [apiResult.address1, apiResult.address2, apiResult.address3]
             .filter(Boolean).join(', ');
         
@@ -307,51 +338,97 @@ function matchPropertyToEPCData(propertyAddress, apiResults, scrapedCerts) {
         const matchResult = isExactHouseNumberMatch(propertyHouseNum, apiHouseNum);
         
         if (matchResult.isExactMatch) {
-            // Calculate street similarity
-            const normalizedAPI = normalizeTextForMatching(apiAddress);
-            const apiWords = normalizedAPI.split(/\s+/).filter(w => w.length > 2);
-            const wordMatches = propertyWords.filter(word => apiWords.includes(word));
-            const streetSimilarity = propertyWords.length > 0 ? wordMatches.length / propertyWords.length : 0;
+            log.info(`   ✓ API Result passed house# filter: ${apiAddress}`);
+            log.info(`      House#: ${apiHouseNum.primary}${apiHouseNum.flat || ''}`);
+        } else {
+            log.info(`   ✗ API Result rejected (${matchResult.matchType}): ${apiAddress}`);
+            log.info(`      House#: ${apiHouseNum.primary || 'N/A'}${apiHouseNum.flat || ''} (expected ${propertyHouseNum.primary}${propertyHouseNum.flat || ''})`);
+        }
+        
+        return matchResult.isExactMatch;
+    });
+    
+    log.info(`   📊 API results after house# filter: ${filteredAPIResults.length}/${apiResults.length}`);
+    
+    // STEP 3: STRICTLY FILTER scraped certs - Keep ONLY exact house number matches
+    log.info(`   📊 Total scraped certs before filtering: ${scrapedCerts.length}`);
+    const filteredScrapedCerts = scrapedCerts.filter(scraped => {
+        const scrapedHouseNum = extractHouseNumber(scraped.address);
+        const matchResult = isExactHouseNumberMatch(propertyHouseNum, scrapedHouseNum);
+        
+        if (matchResult.isExactMatch) {
+            log.info(`   ✓ Scraped cert passed house# filter: ${scraped.address}`);
+            log.info(`      House#: ${scrapedHouseNum.primary}${scrapedHouseNum.flat || ''}, Cert: ${scraped.certificateNumber}`);
+        } else {
+            log.info(`   ✗ Scraped cert rejected (${matchResult.matchType}): ${scraped.address}`);
+            log.info(`      House#: ${scrapedHouseNum.primary || 'N/A'}${scrapedHouseNum.flat || ''} (expected ${propertyHouseNum.primary}${propertyHouseNum.flat || ''})`);
+        }
+        
+        return matchResult.isExactMatch;
+    });
+    
+    log.info(`   📊 Scraped certs after house# filter: ${filteredScrapedCerts.length}/${scrapedCerts.length}`);
+    
+    // STEP 4: If NO exact house number matches, return NULL immediately
+    if (filteredAPIResults.length === 0 && filteredScrapedCerts.length === 0) {
+        log.warning('❌ NO CERTIFICATES WITH EXACT HOUSE NUMBER MATCH - Returning NULL');
+        log.warning(`   Property house#: ${propertyHouseNum.primary}${propertyHouseNum.flat || ''}`);
+        log.warning('   This is CORRECT behavior - we do NOT want fuzzy house number matching!');
+        return null;
+    }
+    
+    // STEP 5: Now calculate street similarity ONLY on filtered subset
+    const normalizedProperty = normalizeTextForMatching(propertyAddress);
+    const propertyWords = normalizedProperty.split(/\s+/).filter(w => w.length > 2);
+    
+    const matches = [];
+    
+    // Process filtered API results
+    for (const apiResult of filteredAPIResults) {
+        const apiAddress = [apiResult.address1, apiResult.address2, apiResult.address3]
+            .filter(Boolean).join(', ');
+        
+        // Calculate street similarity
+        const normalizedAPI = normalizeTextForMatching(apiAddress);
+        const apiWords = normalizedAPI.split(/\s+/).filter(w => w.length > 2);
+        const wordMatches = propertyWords.filter(word => apiWords.includes(word));
+        const streetSimilarity = propertyWords.length > 0 ? wordMatches.length / propertyWords.length : 0;
+        
+        if (streetSimilarity >= 0.3) {
+            // Try to find corresponding certificate number from filtered scraped data
+            let certificateNumber = null;
+            let expired = false;
             
-            if (streetSimilarity >= 0.3) {
-                // Now try to find corresponding certificate number from scraped data
-                let certificateNumber = null;
-                let expired = false;
+            for (const scraped of filteredScrapedCerts) {
+                const normalizedScraped = normalizeTextForMatching(scraped.address);
+                const scrapedWords = normalizedScraped.split(/\s+/).filter(w => w.length > 2);
+                const scrapedWordMatches = propertyWords.filter(word => scrapedWords.includes(word));
+                const scrapedSimilarity = propertyWords.length > 0 ? scrapedWordMatches.length / propertyWords.length : 0;
                 
-                for (const scraped of scrapedCerts) {
-                    const scrapedHouseNum = extractHouseNumber(scraped.address);
-                    const scrapedMatch = isExactHouseNumberMatch(propertyHouseNum, scrapedHouseNum);
-                    
-                    if (scrapedMatch.isExactMatch) {
-                        const normalizedScraped = normalizeTextForMatching(scraped.address);
-                        const scrapedWords = normalizedScraped.split(/\s+/).filter(w => w.length > 2);
-                        const scrapedWordMatches = propertyWords.filter(word => scrapedWords.includes(word));
-                        const scrapedSimilarity = propertyWords.length > 0 ? scrapedWordMatches.length / propertyWords.length : 0;
-                        
-                        if (scrapedSimilarity >= 0.3) {
-                            certificateNumber = scraped.certificateNumber;
-                            expired = scraped.expired;
-                            break;
-                        }
-                    }
+                if (scrapedSimilarity >= 0.3) {
+                    certificateNumber = scraped.certificateNumber;
+                    expired = scraped.expired;
+                    log.info(`   🔗 Matched with scraped cert: ${scraped.address} -> ${certificateNumber}`);
+                    break;
                 }
-                
-                matches.push({
-                    apiData: apiResult,
-                    certificateNumber: certificateNumber,
-                    expired: expired,
-                    streetSimilarity: streetSimilarity,
-                    address: apiAddress
-                });
-                
-                log.info(`   ✓ Match: ${apiAddress}`);
-                log.info(`      Rating: ${apiResult['current-energy-rating']}, Cert: ${certificateNumber || 'N/A'}`);
             }
+            
+            matches.push({
+                apiData: apiResult,
+                certificateNumber: certificateNumber,
+                expired: expired,
+                streetSimilarity: streetSimilarity,
+                address: apiAddress
+            });
+            
+            log.info(`   ✓ Final match candidate: ${apiAddress}`);
+            log.info(`      Street similarity: ${(streetSimilarity * 100).toFixed(1)}%`);
+            log.info(`      Rating: ${apiResult['current-energy-rating']}, Cert: ${certificateNumber || 'N/A'}`);
         }
     }
     
     if (matches.length === 0) {
-        log.warning('❌ No matches found');
+        log.warning('❌ No matches found after street similarity filtering');
         return null;
     }
     
