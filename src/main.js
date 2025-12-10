@@ -434,7 +434,9 @@ async function enrichWithEPCData(properties, apiKey) {
         if (!property.Postcode) continue;
         
         try {
-            const epcData = await scrapeEPCData(property.Postcode, property.Address, apiKey);
+            // REWRITE v4.0: Pass known floor area (if available) for better certificate matching
+            const knownFloorArea = property.Sqm ? parseFloat(property.Sqm) : null;
+            const epcData = await scrapeEPCData(property.Postcode, property.Address, apiKey, knownFloorArea);
             
             if (epcData) {
                 // Store EPC rating
